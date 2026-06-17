@@ -26,10 +26,40 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
 </style>
 </head>
 <body>
-<div id="root"></div>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<div id="root">
+  <div id="boot-fallback" style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0A0A0F;color:#F0F0F8;font-family:sans-serif;padding:24px;text-align:center;gap:12px;">
+    <div style="width:36px;height:36px;border:3px solid rgba(255,255,255,0.1);border-top:3px solid #4AE68A;border-radius:50%;animation:spin 0.8s linear infinite;"></div>
+    <p style="font-size:14px;opacity:0.7;">Loading Just Calories…</p>
+  </div>
+</div>
+<script>
+  // If React hasn't mounted within 8 seconds, something failed to load (likely a CDN issue).
+  // Show a visible error instead of a silent blank screen.
+  window.__bootTimeout = setTimeout(function(){
+    var el = document.getElementById('boot-fallback');
+    if (el) {
+      el.innerHTML = '<p style="font-size:32px;margin-bottom:8px;">⚠️</p>' +
+        '<p style="font-size:15px;font-weight:600;margin-bottom:8px;">Couldn\'t load the app</p>' +
+        '<p style="font-size:13px;opacity:0.6;max-width:280px;line-height:1.5;">This usually means a script failed to load. Check your internet connection and try refreshing. If it keeps happening, tell Jamie.</p>' +
+        '<button onclick="location.reload()" style="margin-top:16px;background:#4AE68A;border:none;border-radius:10px;color:#0A0A0F;font-size:14px;font-weight:600;padding:12px 24px;">Reload</button>';
+    }
+  }, 8000);
+</script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" onerror="window.__scriptFailed=true"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" onerror="window.__scriptFailed=true"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" onerror="window.__scriptFailed=true"></script>
+<script>
+  if (window.__scriptFailed) {
+    clearTimeout(window.__bootTimeout);
+    var el = document.getElementById('boot-fallback');
+    if (el) {
+      el.innerHTML = '<p style="font-size:32px;margin-bottom:8px;">⚠️</p>' +
+        '<p style="font-size:15px;font-weight:600;margin-bottom:8px;">Couldn\'t load required files</p>' +
+        '<p style="font-size:13px;opacity:0.6;max-width:280px;line-height:1.5;">A required script failed to load from the network. Check your internet connection and try refreshing.</p>' +
+        '<button onclick="location.reload()" style="margin-top:16px;background:#4AE68A;border:none;border-radius:10px;color:#0A0A0F;font-size:14px;font-weight:600;padding:12px 24px;">Reload</button>';
+    }
+  }
+</script>
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -1095,7 +1125,18 @@ function App() {
   </div>;
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+if (window.__bootTimeout) clearTimeout(window.__bootTimeout);
+try {
+  ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+} catch(e) {
+  document.getElementById("root").innerHTML =
+    '<div style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0A0A0F;color:#F0F0F8;font-family:sans-serif;padding:24px;text-align:center;gap:8px;">' +
+    '<p style="font-size:32px;">⚠️</p>' +
+    '<p style="font-size:15px;font-weight:600;">Something went wrong</p>' +
+    '<p style="font-size:12px;opacity:0.6;max-width:280px;">' + (e.message||"Unknown error") + '</p>' +
+    '<button onclick="location.reload()" style="margin-top:16px;background:#4AE68A;border:none;border-radius:10px;color:#0A0A0F;font-size:14px;font-weight:600;padding:12px 24px;">Reload</button>' +
+    '</div>';
+}
 </script>
 </body>
 </html>
