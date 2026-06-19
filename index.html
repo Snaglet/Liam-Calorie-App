@@ -33,7 +33,7 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
   </div>
 </div>
 <script>
-  // If React hasn't mounted within 8 seconds, something failed to load (likely a CDN issue).
+  // If the app hasn't mounted within 12 seconds, something failed to load (likely a CDN issue).
   // Show a visible error instead of a silent blank screen.
   window.__bootTimeout = setTimeout(function(){
     var el = document.getElementById('boot-fallback');
@@ -43,24 +43,65 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
         '<p style="font-size:13px;opacity:0.6;max-width:280px;line-height:1.5;">This usually means a script failed to load. Check your internet connection and try refreshing. If it keeps happening, tell Jamie.</p>' +
         '<button onclick="location.reload()" style="margin-top:16px;background:#4AE68A;border:none;border-radius:10px;color:#0A0A0F;font-size:14px;font-weight:600;padding:12px 24px;">Reload</button>';
     }
-  }, 8000);
-</script>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" onerror="window.__scriptFailed=true"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" onerror="window.__scriptFailed=true"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js" onerror="window.__scriptFailed=true"></script>
-<script>
-  if (window.__scriptFailed) {
+  }, 12000);
+
+  function showFailure(msg) {
     clearTimeout(window.__bootTimeout);
     var el = document.getElementById('boot-fallback');
     if (el) {
       el.innerHTML = '<p style="font-size:32px;margin-bottom:8px;">⚠️</p>' +
         '<p style="font-size:15px;font-weight:600;margin-bottom:8px;">Couldn\'t load required files</p>' +
-        '<p style="font-size:13px;opacity:0.6;max-width:280px;line-height:1.5;">A required script failed to load from the network. Check your internet connection and try refreshing.</p>' +
+        '<p style="font-size:13px;opacity:0.6;max-width:280px;line-height:1.5;">' + msg + '</p>' +
         '<button onclick="location.reload()" style="margin-top:16px;background:#4AE68A;border:none;border-radius:10px;color:#0A0A0F;font-size:14px;font-weight:600;padding:12px 24px;">Reload</button>';
     }
   }
+
+  // Load a script from a primary CDN, falling back to a second CDN if the first fails.
+  // Protects against either CDN having an outage — both must fail to break the app.
+  function loadScriptWithFallback(primaryUrl, fallbackUrl, onDone, onFail) {
+    var s = document.createElement('script');
+    s.src = primaryUrl;
+    s.onload = onDone;
+    s.onerror = function() {
+      var f = document.createElement('script');
+      f.src = fallbackUrl;
+      f.onload = onDone;
+      f.onerror = onFail;
+      document.body.appendChild(f);
+    };
+    document.body.appendChild(s);
+  }
+
+  var scriptsToLoad = [
+    ["https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js", "https://unpkg.com/react@18/umd/react.production.min.js"],
+    ["https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js", "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"],
+    ["https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js", "https://unpkg.com/@babel/standalone/babel.min.js"]
+  ];
+
+  function loadNext(i) {
+    if (i >= scriptsToLoad.length) {
+      // All three loaded successfully — transform and run the app source manually,
+      // since Babel wasn't present at parse time to auto-transform the inline script.
+      try {
+        var src = document.getElementById('app-source').textContent;
+        var transformed = Babel.transform(src, { presets: ['react'] }).code;
+        var runner = new Function(transformed);
+        runner();
+      } catch(e) {
+        showFailure('The app failed to start: ' + (e.message||'unknown error') + '. Try reloading.');
+      }
+      return;
+    }
+    loadScriptWithFallback(
+      scriptsToLoad[i][0],
+      scriptsToLoad[i][1],
+      function(){ loadNext(i+1); },
+      function(){ showFailure('Both backup networks failed to load required files. Check your internet connection and try refreshing.'); }
+    );
+  }
+  loadNext(0);
 </script>
-<script type="text/babel">
+<script type="text/plain" id="app-source">
 const { useState, useEffect, useRef, useCallback } = React;
 
 const ls = {
