@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes"/>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
 <meta name="apple-mobile-web-app-title" content="Just Calories"/>
-<link rel="manifest" href="data:application/json,{&quot;name&quot;:&quot;Just Calories&quot;,&quot;short_name&quot;:&quot;Just Calories&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;background_color&quot;:&quot;%230A0A0F&quot;,&quot;theme_color&quot;:&quot;%230A0A0F&quot;}"/>
+<link rel="manifest" href="manifest.json"/>
 <meta name="theme-color" content="#0A0A0F"/>
 <title>Just Calories</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -18,8 +18,6 @@ html,body{height:100%;background:#0A0A0F;font-family:'Inter',sans-serif;overflow
 #root{height:100%;overflow:hidden}
 ::-webkit-scrollbar{width:0}
 @keyframes spin{to{transform:rotate(360deg)}}
-@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
-@keyframes ripple{0%{box-shadow:0 0 0 0 rgba(255,68,68,0.4)}100%{box-shadow:0 0 0 20px rgba(255,68,68,0)}}
 textarea::placeholder{color:rgba(240,240,248,0.28);font-family:'Inter',sans-serif;font-size:13px}
 input::placeholder{color:rgba(240,240,248,0.3)}
 button{font-family:'Inter',sans-serif;cursor:pointer}
@@ -33,14 +31,12 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
   </div>
 </div>
 <script>
-  // If the app hasn't mounted within 12 seconds, something failed to load (likely a CDN issue).
-  // Show a visible error instead of a silent blank screen.
   window.__bootTimeout = setTimeout(function(){
     var el = document.getElementById('boot-fallback');
     if (el) {
       el.innerHTML = '<p style="font-size:32px;margin-bottom:8px;">⚠️</p>' +
         '<p style="font-size:15px;font-weight:600;margin-bottom:8px;">Couldn\'t load the app</p>' +
-        '<p style="font-size:13px;opacity:0.6;max-width:280px;line-height:1.5;">This usually means a script failed to load. Check your internet connection and try refreshing. If it keeps happening, tell Jamie.</p>' +
+        '<p style="font-size:13px;opacity:0.6;max-width:280px;line-height:1.5;">A script failed to load. Check your connection and reload.</p>' +
         '<button onclick="location.reload()" style="margin-top:16px;background:#4AE68A;border:none;border-radius:10px;color:#0A0A0F;font-size:14px;font-weight:600;padding:12px 24px;">Reload</button>';
     }
   }, 12000);
@@ -56,8 +52,6 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
     }
   }
 
-  // Load a script from a primary CDN, falling back to a second CDN if the first fails.
-  // Protects against either CDN having an outage — both must fail to break the app.
   function loadScriptWithFallback(primaryUrl, fallbackUrl, onDone, onFail) {
     var s = document.createElement('script');
     s.src = primaryUrl;
@@ -75,16 +69,17 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
   var scriptsToLoad = [
     ["https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js", "https://unpkg.com/react@18/umd/react.production.min.js"],
     ["https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js", "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"],
-    ["https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js", "https://unpkg.com/@babel/standalone/babel.min.js"]
+    ["https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js", "https://unpkg.com/@babel/standalone@7/babel.min.js"]
   ];
 
   function loadNext(i) {
     if (i >= scriptsToLoad.length) {
-      // All three loaded successfully — transform and run the app source manually,
-      // since Babel wasn't present at parse time to auto-transform the inline script.
       try {
         var src = document.getElementById('app-source').textContent;
-        var transformed = Babel.transform(src, { presets: ['react'] }).code;
+        // runtime:'classic' emits React.createElement. Without it, newer Babel
+        // defaults to the automatic runtime and emits ESM imports, which blow up
+        // inside new Function().
+        var transformed = Babel.transform(src, { presets: [['react', { runtime: 'classic' }]] }).code;
         var runner = new Function(transformed);
         runner();
       } catch(e) {
@@ -96,7 +91,7 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
       scriptsToLoad[i][0],
       scriptsToLoad[i][1],
       function(){ loadNext(i+1); },
-      function(){ showFailure('Both backup networks failed to load required files. Check your internet connection and try refreshing.'); }
+      function(){ showFailure('Both backup networks failed. Check your connection and reload.'); }
     );
   }
   loadNext(0);
@@ -104,14 +99,24 @@ button{font-family:'Inter',sans-serif;cursor:pointer}
 <script type="text/plain" id="app-source">
 const { useState, useEffect, useRef, useCallback } = React;
 
+/* ─── Storage tuning ────────────────────────────────────────────────────────
+   Meal photos live in localStorage (~5MB cap) and age out. Progress photos
+   live in IndexedDB, which has far more room and no retention limit — body
+   photos are the whole point of keeping them for months.
+   ───────────────────────────────────────────────────────────────────────────*/
+const PHOTO_MAX_PX = 480;
+const PHOTO_QUALITY = 0.72;
+const PHOTO_RETENTION_DAYS = 14;
+const ANALYSIS_MAX_PX = 1600;
+const PROGRESS_MAX_PX = 900;
+const PROGRESS_QUALITY = 0.82;
+
 const ls = {
   get: k => { try { return localStorage.getItem(k); } catch { return null; } },
   set: (k,v) => { try { localStorage.setItem(k,v); return true; } catch(e) { console.warn("localStorage write failed:",e); return false; } }
 };
 
-// Downscale a full base64 image to a tiny thumbnail for localStorage.
-// Keeps stored size ~4-8KB vs 500KB+ for full photos — avoids QuotaExceededError.
-function makeThumbnail(base64, mimeType, size=120, quality=0.7) {
+function makeThumbnail(base64, mimeType, size=PHOTO_MAX_PX, quality=PHOTO_QUALITY) {
   return new Promise(resolve => {
     try {
       const img = new Image();
@@ -127,6 +132,72 @@ function makeThumbnail(base64, mimeType, size=120, quality=0.7) {
     } catch { resolve(null); }
   });
 }
+
+function fileToImageData(file, maxPx=ANALYSIS_MAX_PX) {
+  return new Promise(resolve => {
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const img = new Image();
+      img.onload = () => {
+        let w=img.width, h=img.height;
+        if (w>maxPx || h>maxPx) { const s=Math.min(maxPx/w, maxPx/h); w=Math.round(w*s); h=Math.round(h*s); }
+        const canvas=document.createElement("canvas");
+        canvas.width=w; canvas.height=h;
+        canvas.getContext("2d").drawImage(img,0,0,w,h);
+        const dataUrl=canvas.toDataURL("image/jpeg",0.88);
+        resolve({ imageData:{base64:dataUrl.split(",")[1], mimeType:"image/jpeg"}, preview:dataUrl });
+      };
+      img.onerror = () => resolve(null);
+      img.src = ev.target.result;
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+}
+
+/* ─── IndexedDB: progress photos ────────────────────────────────────────────*/
+const IDB_NAME="jct-progress", IDB_STORE="photos";
+function idb() {
+  return new Promise((res,rej) => {
+    const r = indexedDB.open(IDB_NAME, 1);
+    r.onupgradeneeded = () => {
+      const db = r.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE, {keyPath:"id"});
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function progressAll() {
+  try {
+    const db = await idb();
+    return await new Promise((res,rej) => {
+      const tx = db.transaction(IDB_STORE,"readonly");
+      const req = tx.objectStore(IDB_STORE).getAll();
+      req.onsuccess = () => res((req.result||[]).sort((a,b)=>a.takenAt-b.takenAt));
+      req.onerror = () => rej(req.error);
+    });
+  } catch(e) { console.warn("progress read failed:",e); return []; }
+}
+async function progressPut(rec) {
+  const db = await idb();
+  return new Promise((res,rej) => {
+    const tx = db.transaction(IDB_STORE,"readwrite");
+    tx.objectStore(IDB_STORE).put(rec);
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function progressDelete(id) {
+  const db = await idb();
+  return new Promise((res,rej) => {
+    const tx = db.transaction(IDB_STORE,"readwrite");
+    tx.objectStore(IDB_STORE).delete(id);
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
 const loadMeals = d => { try { return JSON.parse(ls.get(`jct:m:${d}`) || "[]"); } catch { return []; } };
 const saveMeals = (d,m) => ls.set(`jct:m:${d}`, JSON.stringify(m));
 const loadBaseGoal = () => parseInt(ls.get("jct:basegoal") || "1600");
@@ -137,15 +208,59 @@ const loadWeights = () => { try { return JSON.parse(ls.get("jct:weights") || "[]
 const saveWeights = w => ls.set("jct:weights", JSON.stringify(w));
 const loadWorkoutLabels = () => { try { return JSON.parse(ls.get("jct:wlabels") || "[]"); } catch { return []; } };
 const saveWorkoutLabels = arr => ls.set("jct:wlabels", JSON.stringify(arr));
-const loadFoodHistory = () => { try { return JSON.parse(ls.get("jct:foodhist") || "[]"); } catch { return []; } };
-const saveFoodHistory = arr => ls.set("jct:foodhist", JSON.stringify(arr));
+const loadLibrary = () => { try { return JSON.parse(ls.get("jct:lib") || "[]"); } catch { return []; } };
+const saveLibrary = arr => ls.set("jct:lib", JSON.stringify(arr));
+const loadItems = () => { try { return JSON.parse(ls.get("jct:items") || "[]"); } catch { return []; } };
+const saveItems = arr => ls.set("jct:items", JSON.stringify(arr));
+
+/* Macro targets. Default split is 30% protein / 40% carbs / 30% fat of the
+   calorie goal; any of the three can be overridden and the override sticks. */
+const MACRO_SPLIT = { protein:0.30, carbs:0.40, fat:0.30 };
+const CAL_PER_G = { protein:4, carbs:4, fat:9 };
+const loadMacroOverrides = () => { try { return JSON.parse(ls.get("jct:macros") || "{}"); } catch { return {}; } };
+const saveMacroOverrides = o => ls.set("jct:macros", JSON.stringify(o));
+function macroTargets(goal) {
+  const o = loadMacroOverrides();
+  const derive = k => Math.round((goal * MACRO_SPLIT[k]) / CAL_PER_G[k]);
+  return {
+    protein: o.protein ?? derive("protein"),
+    carbs:   o.carbs   ?? derive("carbs"),
+    fat:     o.fat     ?? derive("fat")
+  };
+}
 
 const fmtKey = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 const fmtDisplay = d => d.toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"});
 const isToday = d => fmtKey(d) === fmtKey(new Date());
+const shortDate = ts => new Date(ts).toLocaleDateString("en-US",{month:"short",day:"numeric"});
 
-// ─── FIX 1: Remove temperature param — gpt-5.5 only supports default (1) ─────
-// ─── FIX 2: Use max_completion_tokens (correct param for newer models) ────────
+function prunePhotos() {
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - PHOTO_RETENTION_DAYS);
+    const cutKey = fmtKey(cutoff);
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith("jct:m:")) continue;
+      if (key.slice(6) >= cutKey) continue;
+      const meals = JSON.parse(localStorage.getItem(key) || "[]");
+      if (!meals.some(m => m.imageBase64)) continue;
+      localStorage.setItem(key, JSON.stringify(meals.map(m => ({...m, imageBase64: null}))));
+    }
+  } catch(e) { console.warn("photo prune failed:", e); }
+}
+
+async function saveMealsWithFallback(dateKey, meals, rawImage) {
+  if (saveMeals(dateKey, meals)) return true;
+  if (rawImage?.base64) {
+    const small = await makeThumbnail(rawImage.base64, rawImage.mimeType||"image/jpeg", 200, 0.6);
+    const retry = meals.map((m,i) => i===meals.length-1 ? {...m, imageBase64:small} : m);
+    if (saveMeals(dateKey, retry)) return true;
+  }
+  const stripped = meals.map((m,i) => i===meals.length-1 ? {...m, imageBase64:null} : m);
+  return saveMeals(dateKey, stripped);
+}
+
 async function analyze(apiKey, imageData, description) {
   if (!apiKey) throw new Error("No API key — tap ⚙️ Settings to add your OpenAI key");
 
@@ -162,19 +277,25 @@ HOMEMADE / PLATED FOOD:
 - Estimate the ACTUAL portion size visible in the photo. Look for visual cues: plate size, utensils, food density.
 - Never default to a "standard serving" — judge what's actually in the image.
 
-QUANTITIES:
-- If user says "two", "3x", "a dozen" etc, multiply all values by that number.
+QUANTITIES — IMPORTANT:
+- Put the count in the "servings" field, never in the item name. Two crunchy tacos = {"name":"Taco Bell Crunchy Taco","servings":2,...}, NOT {"name":"Crunchy Taco x2","servings":1,...}.
+- calories, proteinG, carbsG and fatG on each ingredient are the values for ONE serving, not the combined total.
+- If the user says "two", "3x", "a dozen" etc, set servings to that number and keep the per-unit values unchanged.
+- Use servings 1 with a descriptive name for a single portion of something ("large bowl of chili").
 
 ACCURACY RULES:
 - Never return 0 calories for any real food item.
-- totalCalories MUST equal the sum of all ingredient calories.
-- Estimate totalProteinG and proteinG for every ingredient.
+- totalCalories MUST equal the sum of (calories × servings) across all ingredients.
+- Estimate proteinG, carbsG and fatG for EVERY ingredient, and the totals.
+- Macros should be roughly consistent with calories (protein 4 cal/g, carbs 4 cal/g, fat 9 cal/g).
 - For emoji: pick ONE emoji that best represents the main food item.
 - Return ONLY raw JSON. No markdown fences, no explanation text, nothing else.`;
 
+  const shape = `{"mealTitle":"...","totalCalories":0,"totalProteinG":0,"totalCarbsG":0,"totalFatG":0,"emoji":"🍔","ingredients":[{"name":"...","servings":1,"calories":0,"proteinG":0,"carbsG":0,"fatG":0}],"summary":"..."}`;
+
   const userPrompt = imageData
-    ? `Analyze this image carefully.${description ? ` User added: "${description}".` : ""} If you see a barcode or package, identify the exact product and use its real nutrition facts. Return this exact JSON: {"mealTitle":"...","totalCalories":0,"totalProteinG":0,"emoji":"🍔","ingredients":[{"name":"...","calories":0,"proteinG":0}],"summary":"..."}`
-    : `The user described their meal: "${description}". Use real brand/USDA data and multiply by any stated quantity. Return this exact JSON: {"mealTitle":"...","totalCalories":0,"totalProteinG":0,"emoji":"🍔","ingredients":[{"name":"...","calories":0,"proteinG":0}],"summary":"..."}`;
+    ? `Analyze this image carefully.${description ? ` User added: "${description}".` : ""} If you see a barcode or package, identify the exact product and use its real nutrition facts. Return this exact JSON: ${shape}`
+    : `The user described their meal: "${description}". Use real brand/USDA data and multiply by any stated quantity. Return this exact JSON: ${shape}`;
 
   const contentArr = [];
   if (imageData) {
@@ -194,8 +315,7 @@ ACCURACY RULES:
         { role: "system", content: sysPrompt },
         { role: "user", content: contentArr }
       ],
-      max_completion_tokens: 800
-      // temperature intentionally omitted — gpt-5.5 only supports the default value of 1
+      max_completion_tokens: 900
     })
   });
 
@@ -219,13 +339,63 @@ ACCURACY RULES:
   }
 }
 
-function recordFoodItems(ingredients) {
+/* ─── Recent ingredients ────────────────────────────────────────────────────
+   Ordered by how often an item has been picked, then by how recently. New
+   items start at 1 use, so the list reads newest-first until picks accumulate
+   and the ones actually reused float to the top.
+   ───────────────────────────────────────────────────────────────────────────*/
+function itemSort(a,b) { return (b.uses||0)-(a.uses||0) || (b.lastUsed||0)-(a.lastUsed||0); }
+
+function recordItems(ingredients, countAsUse=true) {
   if (!ingredients?.length) return;
-  const existing = loadFoodHistory();
+  const list = loadItems();
   const map = {};
-  existing.forEach(f => { map[f.name.toLowerCase()] = f; });
-  ingredients.forEach(f => { map[f.name.toLowerCase()] = {name:f.name,calories:f.calories,proteinG:f.proteinG||0}; });
-  saveFoodHistory(Object.values(map).slice(0,100));
+  list.forEach(f => { map[f.key] = f; });
+  ingredients.forEach(f => {
+    if (!f?.name) return;
+    const key = f.name.trim().toLowerCase();
+    if (!key) return;
+    const prior = map[key];
+    map[key] = {
+      key, name: f.name.trim(),
+      calories: f.baseCalories ?? f.calories ?? 0,
+      proteinG: f.baseProteinG ?? f.proteinG ?? 0,
+      carbsG:   f.baseCarbsG   ?? f.carbsG   ?? 0,
+      fatG:     f.baseFatG     ?? f.fatG     ?? 0,
+      uses: (prior?.uses || 0) + (countAsUse ? 1 : 0),
+      lastUsed: Date.now()
+    };
+  });
+  saveItems(Object.values(map).sort(itemSort).slice(0,150));
+}
+
+function recordMealTemplate(meal) {
+  if (!meal || meal.type === "workout") return;
+  const title = (meal.mealTitle||"").trim();
+  if (!title || title.toLowerCase() === "new meal" || !(meal.totalCalories > 0)) return;
+  const lib = loadLibrary();
+  const key = title.toLowerCase();
+  const prior = lib.find(t => t.key === key);
+  const entry = {
+    key, mealTitle: title, emoji: meal.emoji || "🍽️",
+    totalCalories: meal.totalCalories,
+    totalProteinG: meal.totalProteinG || 0,
+    totalCarbsG: meal.totalCarbsG || 0,
+    totalFatG: meal.totalFatG || 0,
+    summary: meal.summary || "",
+    ingredients: (meal.ingredients||[]).map(i => ({
+      name: i.name, calories: i.calories,
+      proteinG: i.proteinG || 0, carbsG: i.carbsG || 0, fatG: i.fatG || 0,
+      baseCalories: i.baseCalories ?? i.calories,
+      baseProteinG: i.baseProteinG ?? (i.proteinG || 0),
+      baseCarbsG: i.baseCarbsG ?? (i.carbsG || 0),
+      baseFatG: i.baseFatG ?? (i.fatG || 0),
+      servings: i.servings ?? 1
+    })),
+    lastUsed: Date.now(),
+    uses: (prior?.uses || 0) + 1
+  };
+  saveLibrary([entry, ...lib.filter(t => t.key !== key)].sort(itemSort).slice(0, 80));
 }
 
 let _id = Date.now();
@@ -233,22 +403,161 @@ const uid = () => `m${++_id}`;
 
 const C = {
   bg:"#0A0A0F", surface:"#13131A", hover:"#1C1C28", card:"#16161F",
-  border:"rgba(255,255,255,0.06)",
+  border:"rgba(255,255,255,0.10)",
   accent:"#4AE68A", aDim:"rgba(74,230,138,0.12)", aMid:"rgba(74,230,138,0.35)",
-  text:"#F0F0F8", sub:"rgba(240,240,248,0.5)", dim:"rgba(240,240,248,0.22)",
+  text:"#F0F0F8", sub:"rgba(240,240,248,0.66)", dim:"rgba(240,240,248,0.50)",
+  track:"rgba(240,240,248,0.16)",
   red:"#FF4444", rDim:"rgba(255,68,68,0.14)", rMid:"rgba(255,68,68,0.35)",
-  orange:"#FF9500", oDim:"rgba(255,149,0,0.14)", oMid:"rgba(255,149,0,0.35)"
+  orange:"#FF9500", oDim:"rgba(255,149,0,0.14)", oMid:"rgba(255,149,0,0.35)",
+  protein:"#60C8F5", carbs:"#C88CF5", fat:"#F5C860"
 };
 
-const IcCamera = () => <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>;
+const IcCamera = ({size=22}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>;
 const IcMic = ({size=22}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>;
 const IcStop = ({size=18}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="3"/></svg>;
+const IcStack = ({size=22}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>;
+const IcPlus = ({size=16}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>;
+const IcSearch = ({size=16}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>;
+const IcPerson = ({size=17}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>;
 const IcLeft = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>;
 const IcRight = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6"/></svg>;
 const IcEdit = ({size=13}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>;
 const IcBack = () => <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>;
 const IcTrash = () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>;
 const IcGear = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>;
+
+/* ─── Speech ────────────────────────────────────────────────────────────────
+   ONE SpeechRecognition instance for the whole app. Building a new one on every
+   start() causes repeat permission prompts within a session — reusing this keeps
+   the first grant alive until the app is fully closed. iOS still asks once per
+   app launch; that's an OS rule with no workaround.
+   ───────────────────────────────────────────────────────────────────────────*/
+let _rec = null;
+function getRecognizer() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return null;
+  if (!_rec) {
+    _rec = new SR();
+    _rec.continuous = true;
+    _rec.interimResults = true;
+    _rec.lang = "en-US";
+  }
+  return _rec;
+}
+
+function useWebSpeech(onUpdate) {
+  const [listening, setListening] = useState(false);
+  const supported = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const activeRef = useRef(false);
+
+  const start = useCallback(() => {
+    if (!supported || activeRef.current) return;
+    const rec = getRecognizer();
+    if (!rec) return;
+    let final = "";
+    rec.onresult = e => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) final += t + " ";
+        else interim = t;
+      }
+      onUpdate(final + interim);
+    };
+    // onstart fires only once the OS actually hands over audio, so the UI never
+    // shows "listening" while the permission dialog is still up.
+    rec.onstart = () => { activeRef.current = true; setListening(true); };
+    rec.onerror = () => { activeRef.current = false; setListening(false); };
+    rec.onend   = () => { activeRef.current = false; setListening(false); };
+    try { rec.start(); } catch { /* already running */ }
+  }, [supported, onUpdate]);
+
+  const stop = useCallback(() => {
+    try { _rec?.stop(); } catch {}
+    activeRef.current = false;
+    setListening(false);
+  }, []);
+
+  return { listening, supported, start, stop };
+}
+
+/* Listening indicator. Deliberately not a waveform — reading real levels needs
+   getUserMedia, a second permission prompt. This shows recording state only;
+   the live transcript is the real feedback. */
+function ListeningBars({active}) {
+  const canvasRef = useRef(null);
+  const rafRef = useRef(null);
+  const BARS = 24;
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const flat = () => {
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      const bw = canvas.width/BARS;
+      ctx.fillStyle = "rgba(74,230,138,0.18)";
+      for (let i=0;i<BARS;i++){ ctx.beginPath(); ctx.roundRect(i*bw+1,(canvas.height-4)/2,bw-2,4,2); ctx.fill(); }
+    };
+    if (!active) { cancelAnimationFrame(rafRef.current); flat(); return; }
+    let t = 0;
+    const animate = () => {
+      rafRef.current = requestAnimationFrame(animate);
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      const bw=canvas.width/BARS, maxH=canvas.height*0.88;
+      for (let i=0;i<BARS;i++){
+        const v=Math.abs(Math.sin(t*2.1+i*0.4))*0.55+0.12;
+        const h=Math.max(4,v*maxH);
+        ctx.fillStyle=`rgba(74,230,138,${0.22+v*0.55})`;
+        ctx.beginPath(); ctx.roundRect(i*bw+1,(canvas.height-h)/2,bw-2,h,3); ctx.fill();
+      }
+      t+=0.05;
+    };
+    animate();
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [active]);
+  return <div style={{width:"100%",height:52,display:"flex",alignItems:"center"}}>
+    <canvas ref={canvasRef} width={340} height={52} style={{width:"100%",height:"100%",opacity:active?1:0.3,transition:"opacity 0.3s"}}/>
+  </div>;
+}
+
+/* Roll up the last n days of logged food into per-day macro totals.
+   Workouts are excluded — they subtract calories, not add macros. */
+function collectDays(n=30) {
+  const out=[];
+  for (let i=n-1;i>=0;i--) {
+    const d=new Date(); d.setDate(d.getDate()-i);
+    const key=fmtKey(d);
+    const food=loadMeals(key).filter(m=>m.type!=="workout");
+    out.push({
+      date:key,
+      calories: food.reduce((s,m)=>s+(m.totalCalories||0),0),
+      protein:  Math.round(food.reduce((s,m)=>s+(m.totalProteinG||0),0)),
+      carbs:    Math.round(food.reduce((s,m)=>s+(m.totalCarbsG||0),0)),
+      fat:      Math.round(food.reduce((s,m)=>s+(m.totalFatG||0),0))
+    });
+  }
+  return out;
+}
+
+function StickyHeader({left, title, right}) {
+  return <div style={{
+    position:"sticky", top:0, zIndex:30,
+    display:"flex", alignItems:"center", justifyContent:"space-between",
+    padding:"calc(env(safe-area-inset-top,44px) + 12px) 16px 12px",
+    background:C.bg, borderBottom:`1px solid ${C.border}`
+  }}>
+    {left || <div style={{width:44}}/>}
+    <span style={{fontSize:16,fontWeight:500,color:C.text}}>{title}</span>
+    {right || <div style={{width:44}}/>}
+  </div>;
+}
+
+const HeaderBtn = ({onClick,tone="neutral",children}) => <button
+  style={{width:44,height:44,borderRadius:12,flexShrink:0,
+    background: tone==="danger"?C.rDim:C.hover,
+    border:`1px solid ${tone==="danger"?C.rMid:C.border}`,
+    color: tone==="danger"?C.red:C.text,
+    display:"flex",alignItems:"center",justifyContent:"center"}}
+  onClick={onClick}>{children}</button>;
 
 function Spinner({text}) {
   return <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",gap:20,background:C.bg}}>
@@ -257,117 +566,64 @@ function Spinner({text}) {
   </div>;
 }
 
-// ─── VoiceVisualizer ─────────────────────────────────────────────────────────
-// Accepts mediaStream prop from parent. If no stream given, renders animated
-// placeholder bars — zero extra permission prompts.
-function VoiceVisualizer({active, mediaStream}) {
-  const canvasRef = useRef(null);
-  const rafRef = useRef(null);
-  const acRef = useRef(null);
-  const BARS = 24;
-
-  useEffect(() => {
-    const canvas = canvasRef.current; if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-
-    const flat = () => {
-      ctx.clearRect(0,0,canvas.width,canvas.height);
-      const bw = canvas.width/BARS;
-      ctx.fillStyle = "rgba(74,230,138,0.18)";
-      for(let i=0;i<BARS;i++){
-        const h=4;
-        ctx.beginPath();
-        ctx.roundRect(i*bw+1,(canvas.height-h)/2,bw-2,h,2);
-        ctx.fill();
-      }
-    };
-
-    if (!active) {
-      cancelAnimationFrame(rafRef.current);
-      try{acRef.current?.close();acRef.current=null;}catch{}
-      flat();
-      return;
-    }
-
-    // No real stream — animate fake bars, no mic permission needed
-    if (!mediaStream) {
-      let t = 0;
-      const animate = () => {
-        rafRef.current = requestAnimationFrame(animate);
-        ctx.clearRect(0,0,canvas.width,canvas.height);
-        const bw=canvas.width/BARS, maxH=canvas.height*0.88;
-        for(let i=0;i<BARS;i++){
-          const v=Math.abs(Math.sin(t*2.1+i*0.4))*0.55+0.12;
-          const h=Math.max(4,v*maxH);
-          ctx.fillStyle=`rgba(74,230,138,${0.22+v*0.55})`;
-          ctx.beginPath();
-          ctx.roundRect(i*bw+1,(canvas.height-h)/2,bw-2,h,3);
-          ctx.fill();
-        }
-        t+=0.05;
-      };
-      animate();
-      return () => cancelAnimationFrame(rafRef.current);
-    }
-
-    // Real stream — attach analyser for genuine waveform
-    try {
-      const ac = new(window.AudioContext||window.webkitAudioContext)();
-      acRef.current = ac;
-      const src = ac.createMediaStreamSource(mediaStream);
-      const an = ac.createAnalyser(); an.fftSize=64; src.connect(an);
-      const buf = new Uint8Array(an.frequencyBinCount);
-      const draw = () => {
-        rafRef.current = requestAnimationFrame(draw);
-        an.getByteFrequencyData(buf);
-        ctx.clearRect(0,0,canvas.width,canvas.height);
-        const bw=canvas.width/BARS,maxH=canvas.height*0.88;
-        for(let i=0;i<BARS;i++){
-          const v=buf[Math.floor(i*buf.length/BARS)]/255;
-          const h=Math.max(4,v*maxH);
-          ctx.fillStyle=`rgba(74,230,138,${0.3+v*0.7})`;
-          ctx.beginPath();
-          ctx.roundRect(i*bw+1,(canvas.height-h)/2,bw-2,h,3);
-          ctx.fill();
-        }
-      };
-      draw();
-    } catch { flat(); }
-
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      try{acRef.current?.close();acRef.current=null;}catch{}
-    };
-  }, [active, mediaStream]);
-
-  return <div style={{width:"100%",height:52,display:"flex",alignItems:"center"}}>
-    <canvas ref={canvasRef} width={340} height={52} style={{width:"100%",height:"100%",opacity:active?1:0.3,transition:"opacity 0.3s"}}/>
+/* Compact macro column — three of these fit on one row, saving ~70px of
+   vertical space versus stacked full-width bars. */
+function MacroMini({label,value,target,color,onOpen}) {
+  const pct = target>0 ? Math.min(value/target,1) : 0;
+  const over = target>0 && value>target;
+  return <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={onOpen}>
+    <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",marginBottom:3}}>
+      <span style={{fontSize:9,fontWeight:400,color:C.sub,textTransform:"uppercase",letterSpacing:"0.7px"}}>{label}</span>
+      <span style={{fontSize:9,fontWeight:300,color:over?C.orange:C.dim}}>{target>0?Math.round((value/target)*100):0}%</span>
+    </div>
+    <div style={{display:"flex",alignItems:"baseline",gap:2,marginBottom:5}}>
+      <span style={{fontSize:16,fontWeight:300,color:C.text,letterSpacing:"-0.4px"}}>{Math.round(value)}</span>
+      <span style={{fontSize:10,fontWeight:300,color:C.dim}}>/{target}g</span>
+    </div>
+    <div style={{height:4,borderRadius:2,background:C.track,overflow:"hidden"}}>
+      <div style={{width:`${pct*100}%`,height:"100%",background:over?C.orange:color,borderRadius:2,transition:"width 0.35s ease"}}/>
+    </div>
   </div>;
 }
 
-function WeightSparkline({data}) {
-  if (data.length<2) return null;
-  const W=120,H=36,P=4,vals=data.map(d=>d.value);
-  const mn=Math.min(...vals),mx=Math.max(...vals),lo=mn-0.5,hi=mx+0.5,range=hi-lo||1;
-  const tx=i=>P+(i/(data.length-1))*(W-P*2),ty=v=>P+(1-(v-lo)/range)*(H-P*2);
-  const pts=data.map((d,i)=>`${tx(i)},${ty(d.value)}`).join(" ");
-  const area=`M${tx(0)},${ty(data[0].value)} `+data.slice(1).map((d,i)=>`L${tx(i+1)},${ty(d.value)}`).join(" ")+` L${tx(data.length-1)},${H} L${tx(0)},${H} Z`;
-  const last=data[data.length-1].value,prev=data[data.length-2].value,color=last<=prev?C.accent:C.red;
-  return <svg width={W} height={H} style={{overflow:"visible"}}>
-    <defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity="0.3"/><stop offset="100%" stopColor={color} stopOpacity="0"/></linearGradient></defs>
-    <path d={area} fill="url(#sg)"/>
-    <polyline points={pts} fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-    <circle cx={tx(data.length-1)} cy={ty(last)} r="3" fill={color}/>
-  </svg>;
+/* Full-width weight chart with min/max labels and a 7-day delta. */
+function WeightChart({data,height=84}) {
+  if (!data.length) return null;
+  const pts = data.slice(-30);
+  if (pts.length < 2) return <p style={{fontSize:11,fontWeight:300,color:C.dim}}>Log another day to see the trend</p>;
+  const W=320,H=84,PX=6,PY=10;
+  const vals=pts.map(d=>d.value);
+  const mn=Math.min(...vals), mx=Math.max(...vals);
+  const lo=mn-0.4, hi=mx+0.4, range=hi-lo||1;
+  const tx=i=>PX+(i/(pts.length-1))*(W-PX*2);
+  const ty=v=>PY+(1-(v-lo)/range)*(H-PY*2);
+  const line=pts.map((d,i)=>`${tx(i)},${ty(d.value)}`).join(" ");
+  const area=`M${tx(0)},${ty(pts[0].value)} `+pts.slice(1).map((d,i)=>`L${tx(i+1)},${ty(d.value)}`).join(" ")+` L${tx(pts.length-1)},${H} L${tx(0)},${H} Z`;
+  const last=pts[pts.length-1].value;
+  const trendDown = last <= pts[0].value;
+  const color = trendDown ? C.accent : C.orange;
+  return <div style={{width:"100%"}}>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{width:"100%",height,display:"block"}}>
+      <defs><linearGradient id="wg" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stopColor={color} stopOpacity="0.28"/><stop offset="100%" stopColor={color} stopOpacity="0"/>
+      </linearGradient></defs>
+      <path d={area} fill="url(#wg)"/>
+      <polyline points={line} fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke"/>
+      <circle cx={tx(pts.length-1)} cy={ty(last)} r="3.5" fill={color}/>
+    </svg>
+    <div style={{display:"flex",justifyContent:"space-between",marginTop:4}}>
+      <span style={{fontSize:10,fontWeight:300,color:C.dim}}>{shortDate(new Date(pts[0].date+"T12:00:00").getTime())} · {pts[0].value}</span>
+      <span style={{fontSize:10,fontWeight:300,color:C.dim}}>range {mn}–{mx} lbs</span>
+    </div>
+  </div>;
 }
 
-function MealCard({meal,onTap,onQuickEdit,onDelete}) {
+function MealCard({meal,onTap,onDelete}) {
   const [swipeX,setSwipeX]=useState(0);
   const [swiping,setSwiping]=useState(false);
   const tx=useRef(0),ty=useRef(0);
   const isWorkout=meal.type==="workout";
   const THRESHOLD=80;
-  // Build a compact serving summary for the card, e.g. "Bread 1 srv · Bacon 2 srv"
   const srvSummary = !isWorkout && meal.ingredients?.length
     ? meal.ingredients.map(i=>`${i.name}${i.servings && i.servings!==1 ? ` ×${i.servings}` : ""}`).slice(0,3).join(" · ") + (meal.ingredients.length>3?" …":"")
     : null;
@@ -387,18 +643,19 @@ function MealCard({meal,onTap,onQuickEdit,onDelete}) {
       }
       <div style={{flex:1,minWidth:0}}>
         <p style={{fontSize:13,fontWeight:400,color:isWorkout?C.orange:C.text,marginBottom:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{meal.mealTitle}</p>
-        {srvSummary
-          ? <p style={{fontSize:11,fontWeight:300,color:C.sub,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginBottom:1}}>{srvSummary}</p>
-          : <p style={{fontSize:11,fontWeight:300,color:C.sub,lineHeight:1.4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{meal.summary}</p>
-        }
+        <p style={{fontSize:11,fontWeight:300,color:C.sub,lineHeight:1.4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginBottom:1}}>{srvSummary || meal.summary}</p>
         <p style={{fontSize:10,fontWeight:300,color:C.dim,marginTop:2}}>{meal.time}</p>
       </div>
-      <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2,flexShrink:0,paddingLeft:8}}>
+      <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:3,flexShrink:0,paddingLeft:8}}>
         <div style={{display:"flex",alignItems:"baseline",gap:3,padding:"6px 10px",background:isWorkout?C.oDim:C.aDim,borderRadius:10}}>
           <span style={{fontSize:18,fontWeight:200,color:isWorkout?C.orange:C.accent,letterSpacing:"-0.5px"}}>{isWorkout?"-":""}{meal.totalCalories}</span>
           <span style={{fontSize:9,fontWeight:300,color:isWorkout?C.oMid:C.aMid,textTransform:"uppercase"}}>cal</span>
         </div>
-        {!isWorkout&&(meal.totalProteinG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:"rgba(96,200,245,0.7)"}}>{Math.round(meal.totalProteinG||0)}g pro</span>}
+        {!isWorkout&&<div style={{display:"flex",gap:6}}>
+          {(meal.totalProteinG||0)>0&&<span style={{fontSize:9,fontWeight:300,color:C.protein}}>{Math.round(meal.totalProteinG)}p</span>}
+          {(meal.totalCarbsG||0)>0&&<span style={{fontSize:9,fontWeight:300,color:C.carbs}}>{Math.round(meal.totalCarbsG)}c</span>}
+          {(meal.totalFatG||0)>0&&<span style={{fontSize:9,fontWeight:300,color:C.fat}}>{Math.round(meal.totalFatG)}f</span>}
+        </div>}
       </div>
     </div>
   </div>;
@@ -423,8 +680,8 @@ function WorkoutModal({onAdd,onClose}) {
   return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"flex-end",zIndex:100}} onClick={onClose}>
     <div style={{width:"100%",background:C.surface,borderRadius:"20px 20px 0 0",padding:"24px 20px 48px",border:`1px solid ${C.border}`}} onClick={e=>e.stopPropagation()}>
       <div style={{width:36,height:4,background:C.border,borderRadius:2,margin:"0 auto 20px"}}/>
-      <p style={{fontSize:17,fontWeight:500,color:C.text,marginBottom:4}}>Log Workout</p>
-      <p style={{fontSize:12,fontWeight:300,color:C.sub,marginBottom:20}}>Calories burned will increase today's goal</p>
+      <p style={{fontSize:17,fontWeight:500,color:C.text,marginBottom:4}}>Log workout</p>
+      <p style={{fontSize:12,fontWeight:300,color:C.sub,marginBottom:20}}>Calories burned raise today's goal</p>
       <div style={{position:"relative",marginBottom:12}}>
         <input type="text" placeholder="Activity (e.g. OrangeTheory, Walking…)" value={label} onChange={e=>handleLabelChange(e.target.value)} onBlur={()=>setTimeout(()=>setShowSugg(false),150)}
           style={{width:"100%",background:C.hover,border:`1px solid ${C.border}`,borderRadius:12,color:C.text,fontSize:15,padding:"12px 16px",outline:"none",fontFamily:"'Inter',sans-serif"}}/>
@@ -434,31 +691,36 @@ function WorkoutModal({onAdd,onClose}) {
       </div>
       <input ref={calRef} type="number" inputMode="numeric" placeholder="Calories burned" value={cal} onChange={e=>setCal(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}
         style={{width:"100%",background:C.hover,border:`1px solid ${C.border}`,borderRadius:12,color:C.text,fontSize:22,fontWeight:200,padding:"14px 16px",outline:"none",fontFamily:"'Inter',sans-serif",marginBottom:16,letterSpacing:"-0.5px"}}/>
-      <button style={{width:"100%",background:C.orange,border:"none",borderRadius:14,color:"#fff",fontSize:15,fontWeight:500,padding:"16px",opacity:parseInt(cal)>0?1:0.4}} onClick={submit} disabled={!(parseInt(cal)>0)}>Add Workout 🔥</button>
+      <button style={{width:"100%",background:C.orange,border:"none",borderRadius:14,color:"#fff",fontSize:15,fontWeight:500,padding:"16px",opacity:parseInt(cal)>0?1:0.4}} onClick={submit} disabled={!(parseInt(cal)>0)}>Add workout 🔥</button>
     </div>
   </div>;
 }
 
-function SettingsScreen({apiKey,onSave,onClear,onBack}) {
+function SettingsScreen({apiKey,onSave,onClear,onBack,goal}) {
   const [val,setVal]=useState("");
   const [saved,setSaved]=useState(false);
   const [err,setErr]=useState("");
+  const [macros,setMacros]=useState(()=>macroTargets(goal));
+  const [ov,setOv]=useState(()=>loadMacroOverrides());
   const masked = apiKey ? `${apiKey.slice(0,14)}…${apiKey.slice(-4)}` : null;
   const submit=()=>{
     const t=val.trim();
-    if(!t){setErr("Please enter an API key");return;}
+    if(!t){setErr("Enter an API key to continue");return;}
     onSave(t);setSaved(true);setVal("");setErr("");
     setTimeout(()=>setSaved(false),2500);
   };
+  const setMacro=(k,v)=>{
+    const n=parseInt(v);
+    const next={...ov};
+    if(!isNaN(n)&&n>0) next[k]=n; else delete next[k];
+    setOv(next); saveMacroOverrides(next); setMacros(macroTargets(goal));
+  };
+  const resetMacros=()=>{ setOv({}); saveMacroOverrides({}); setMacros(macroTargets(goal)); };
   return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:48}}>
-    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"calc(env(safe-area-inset-top,44px) + 12px) 16px 20px"}}>
-      <button style={{width:44,height:44,borderRadius:12,background:C.hover,border:`1px solid ${C.border}`,color:C.text,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onBack}><IcBack/></button>
-      <span style={{fontSize:16,fontWeight:500,color:C.text}}>Settings</span>
-      <div style={{width:44}}/>
-    </div>
-    <div style={{padding:"0 16px",display:"flex",flexDirection:"column",gap:14}}>
+    <StickyHeader left={<HeaderBtn onClick={onBack}><IcBack/></HeaderBtn>} title="Settings"/>
+    <div style={{padding:"16px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
       <div style={{background:C.surface,borderRadius:18,border:`1px solid ${C.border}`,padding:"18px 18px 16px"}}>
-        <p style={{fontSize:14,fontWeight:500,color:C.text,marginBottom:6}}>OpenAI API Key</p>
+        <p style={{fontSize:14,fontWeight:500,color:C.text,marginBottom:6}}>OpenAI API key</p>
         {masked
           ?<div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,padding:"10px 12px",background:C.aDim,borderRadius:10,border:`1px solid ${C.aMid}`}}>
             <div style={{flex:1}}>
@@ -467,25 +729,41 @@ function SettingsScreen({apiKey,onSave,onClear,onBack}) {
             </div>
             <button style={{background:C.rDim,border:`1px solid ${C.rMid}`,borderRadius:8,color:C.red,fontSize:11,fontWeight:500,padding:"4px 10px",flexShrink:0}} onClick={()=>{onClear();setVal("");setErr("");setSaved(false);}}>Clear</button>
           </div>
-          :<p style={{fontSize:12,color:C.red,marginBottom:12,fontWeight:500}}>⚠ No key set — meals cannot be analyzed</p>
+          :<p style={{fontSize:12,color:C.red,marginBottom:12,fontWeight:500}}>⚠ No key set — meals can't be analyzed</p>
         }
         <p style={{fontSize:12,color:C.sub,lineHeight:1.6,marginBottom:12}}>Get a key at <span style={{color:C.accent}}>platform.openai.com/api-keys</span>. Stored only on this device.</p>
-        <input type="password" placeholder={masked?"Enter new key to replace…":"sk-..."} value={val}
+        <input type="password" placeholder={masked?"Enter a new key to replace…":"sk-..."} value={val}
           onChange={e=>{setVal(e.target.value);setErr("");setSaved(false);}}
           onKeyDown={e=>e.key==="Enter"&&submit()}
           style={{width:"100%",background:C.hover,border:`1px solid ${err?C.red:C.border}`,borderRadius:12,color:C.text,fontSize:14,padding:"13px 14px",outline:"none",fontFamily:"'Inter',sans-serif",marginBottom:8}}/>
         {err&&<p style={{color:C.red,fontSize:12,marginBottom:8}}>{err}</p>}
         <button style={{width:"100%",background:saved?C.aDim:C.accent,border:saved?`1px solid ${C.aMid}`:"none",borderRadius:12,color:saved?C.accent:C.bg,fontSize:14,fontWeight:500,padding:"13px"}} onClick={submit}>
-          {saved?"✓ Key Saved!":"Save Key"}
+          {saved?"✓ Key saved":"Save key"}
         </button>
       </div>
+
       <div style={{background:C.surface,borderRadius:18,border:`1px solid ${C.border}`,padding:"18px"}}>
-        <p style={{fontSize:14,fontWeight:500,color:C.text,marginBottom:8}}>Voice Transcription</p>
-        <p style={{fontSize:12,fontWeight:300,color:C.sub,lineHeight:1.7}}>Voice logging uses your browser's built-in speech recognition — free, no extra key needed. Works best in Chrome and Safari on iOS/Android.</p>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+          <p style={{fontSize:14,fontWeight:500,color:C.text}}>Macro targets</p>
+          {Object.keys(ov).length>0&&<button style={{background:"none",border:"none",color:C.accent,fontSize:11,padding:0}} onClick={resetMacros}>Reset</button>}
+        </div>
+        <p style={{fontSize:12,fontWeight:300,color:C.sub,lineHeight:1.6,marginBottom:14}}>Defaults come from your {goal} cal goal at 30% protein / 40% carbs / 30% fat. Type a number to pin one.</p>
+        {["protein","carbs","fat"].map(k=>
+          <div key={k} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 0",borderTop:`1px solid ${C.border}`}}>
+            <span style={{fontSize:13,fontWeight:300,color:C[k],textTransform:"capitalize"}}>{k}</span>
+            <div style={{display:"flex",alignItems:"baseline",gap:5}}>
+              <input type="number" inputMode="numeric" placeholder={String(macros[k])} value={ov[k] ?? ""}
+                onChange={e=>setMacro(k,e.target.value)}
+                style={{width:64,background:"transparent",border:"none",borderBottom:`1px solid ${C.border}`,color:C.text,fontSize:16,fontWeight:200,textAlign:"right",outline:"none",fontFamily:"'Inter',sans-serif"}}/>
+              <span style={{fontSize:11,color:C.dim}}>g</span>
+            </div>
+          </div>
+        )}
       </div>
+
       <div style={{background:C.surface,borderRadius:18,border:`1px solid ${C.border}`,padding:"18px"}}>
-        <p style={{fontSize:14,fontWeight:500,color:C.text,marginBottom:8}}>About Just Calories</p>
-        <p style={{fontSize:12,fontWeight:300,color:C.sub,lineHeight:1.7}}>Photos are analyzed by GPT-5.5 — including barcodes and food labels. Voice descriptions are processed locally by your browser. All data stored on-device only.</p>
+        <p style={{fontSize:14,fontWeight:500,color:C.text,marginBottom:8}}>Photos & storage</p>
+        <p style={{fontSize:12,fontWeight:300,color:C.sub,lineHeight:1.7}}>Meal photos are saved on this device at {PHOTO_MAX_PX}px and cleared after {PHOTO_RETENTION_DAYS} days — calories and ingredients are kept for good. Progress photos are stored separately at {PROGRESS_MAX_PX}px and never expire. Nothing leaves your phone except the image sent for analysis.</p>
       </div>
     </div>
   </div>;
@@ -494,7 +772,7 @@ function SettingsScreen({apiKey,onSave,onClear,onBack}) {
 function ApiKeyScreen({onSave}) {
   const [val,setVal]=useState("");
   const [err,setErr]=useState("");
-  const submit=()=>{if(!val.trim()){setErr("Please enter your API key");return;}onSave(val.trim());};
+  const submit=()=>{if(!val.trim()){setErr("Enter your API key to continue");return;}onSave(val.trim());};
   return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100%",background:C.bg}}>
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"40px 28px",width:"100%",maxWidth:380}}>
       <span style={{fontSize:52,marginBottom:12}}>⚡</span>
@@ -506,14 +784,24 @@ function ApiKeyScreen({onSave}) {
         <input style={{width:"100%",background:C.hover,border:`1px solid ${err?C.red:C.border}`,borderRadius:12,color:C.text,fontSize:15,padding:"14px 16px",outline:"none",fontFamily:"'Inter',sans-serif"}}
           type="password" placeholder="sk-..." value={val} onChange={e=>{setVal(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&submit()}/>
         {err&&<p style={{color:C.red,fontSize:12,marginTop:6}}>{err}</p>}
-        <button style={{width:"100%",background:C.accent,border:"none",borderRadius:14,color:C.bg,fontSize:15,fontWeight:500,padding:"16px",marginTop:14}} onClick={submit}>Get Started →</button>
+        <button style={{width:"100%",background:C.accent,border:"none",borderRadius:14,color:C.bg,fontSize:15,fontWeight:500,padding:"16px",marginTop:14}} onClick={submit}>Get started →</button>
       </div>
       <p style={{color:C.dim,fontSize:11,marginTop:14,textAlign:"center",lineHeight:1.6}}>Stored only on this device. Never shared.</p>
     </div>
   </div>;
 }
 
-function HomeScreen({onOpenCamera,onOpenVoice,onSelectMeal,onAddWorkout,onOpenSettings,onOpenWeightHistory,meals,goal,baseGoal,setBaseGoal,date,setDate}) {
+const ActionBtn = ({onClick,tone,icon,label}) => {
+  const bg = tone==="accent"?C.aDim : tone==="orange"?C.oDim : C.surface;
+  const bd = tone==="accent"?C.aMid : tone==="orange"?C.oMid : C.border;
+  const fg = tone==="accent"?C.accent : tone==="orange"?C.orange : C.text;
+  return <button style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:5,padding:"13px 4px",background:bg,border:`1px solid ${bd}`,borderRadius:16,color:fg}} onClick={onClick}>
+    {icon}
+    <span style={{fontSize:10,fontWeight:400,color:fg,opacity:0.85}}>{label}</span>
+  </button>;
+};
+
+function HomeScreen({onOpenCamera,onOpenDescribe,onOpenLibrary,onSelectMeal,onAddWorkout,onOpenSettings,onOpenWeightHistory,onOpenProgress,onOpenMacro,meals,goal,baseGoal,setBaseGoal,date,setDate}) {
   const [editGoal,setEditGoal]=useState(false);
   const [goalVal,setGoalVal]=useState(String(baseGoal));
   const [weightLog,setWeightLog]=useState(()=>loadWeights());
@@ -522,233 +810,208 @@ function HomeScreen({onOpenCamera,onOpenVoice,onSelectMeal,onAddWorkout,onOpenSe
   const [showWorkout,setShowWorkout]=useState(false);
   const fileRef=useRef();
 
-  const eaten=meals.filter(m=>m.type!=="workout").reduce((s,m)=>s+m.totalCalories,0);
-  const burned=meals.filter(m=>m.type==="workout").reduce((s,m)=>s+m.totalCalories,0);
-  const protein=Math.round(meals.filter(m=>m.type!=="workout").reduce((s,m)=>s+(m.totalProteinG||0),0));
-  const latestW=weightLog.length>0?weightLog[weightLog.length-1].value:0;
+  const food = meals.filter(m=>m.type!=="workout");
+  const eaten = food.reduce((s,m)=>s+m.totalCalories,0);
+  const burned = meals.filter(m=>m.type==="workout").reduce((s,m)=>s+m.totalCalories,0);
+  const protein = food.reduce((s,m)=>s+(m.totalProteinG||0),0);
+  const carbs = food.reduce((s,m)=>s+(m.totalCarbsG||0),0);
+  const fat = food.reduce((s,m)=>s+(m.totalFatG||0),0);
+  const targets = macroTargets(goal);
+  const latestW = weightLog.length>0 ? weightLog[weightLog.length-1].value : 0;
+  const calPct = goal>0 ? Math.min(eaten/goal,1) : 0;
+  const overCal = eaten > goal;
+  const remaining = goal - eaten;
+
+  // Delta against the closest reading at least 7 days back.
+  const weekDelta = (() => {
+    if (weightLog.length<2) return null;
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-7);
+    const key = fmtKey(cutoff);
+    const older = weightLog.filter(w=>w.date<=key);
+    const ref = older.length ? older[older.length-1] : weightLog[0];
+    const d = Math.round((latestW-ref.value)*10)/10;
+    return d===0 ? null : d;
+  })();
 
   const commitGoal=()=>{const n=parseInt(goalVal);if(!isNaN(n)&&n>0){setBaseGoal(n);saveBaseGoal(n);}else setGoalVal(String(baseGoal));setEditGoal(false);};
   const commitWeight=()=>{const n=parseFloat(weightVal);if(!isNaN(n)&&n>0){const entry={date:fmtKey(new Date()),value:n};const next=[...weightLog.filter(w=>w.date!==entry.date),entry].sort((a,b)=>a.date.localeCompare(b.date));setWeightLog(next);saveWeights(next);}setEditWeight(false);};
   const shift=days=>{const d=new Date(date);d.setDate(d.getDate()+days);setDate(d);};
 
-  return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:40}}>
+  return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:"calc(env(safe-area-inset-bottom,12px) + 104px)"}}>
     <div style={{padding:"env(safe-area-inset-top,44px) 20px 0",background:`linear-gradient(180deg,${C.surface} 0%,${C.bg} 100%)`}}>
       <div style={{paddingTop:12,display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <span style={{fontSize:20}}>⚡</span>
           <span style={{fontSize:17,fontWeight:500,color:C.text,letterSpacing:"-0.3px"}}>Just Calories</span>
         </div>
-        <button style={{width:36,height:36,borderRadius:10,background:C.hover,border:`1px solid ${C.border}`,color:C.sub,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onOpenSettings}><IcGear/></button>
+        <div style={{display:"flex",gap:8}}>
+          <button style={{width:36,height:36,borderRadius:10,background:C.hover,border:`1px solid ${C.border}`,color:C.sub,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onOpenProgress}><IcPerson size={18}/></button>
+          <button style={{width:36,height:36,borderRadius:10,background:C.hover,border:`1px solid ${C.border}`,color:C.sub,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onOpenSettings}><IcGear/></button>
+        </div>
       </div>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
         <button style={{width:34,height:34,borderRadius:10,background:C.hover,border:`1px solid ${C.border}`,color:C.sub,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>shift(-1)}><IcLeft/></button>
         <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
           <span style={{fontSize:14,fontWeight:400,color:C.text}}>{fmtDisplay(date)}</span>
-          {!isToday(date)&&<button style={{background:C.aDim,border:`1px solid ${C.aMid}`,color:C.accent,borderRadius:20,fontSize:11,fontWeight:600,padding:"2px 10px"}} onClick={()=>setDate(new Date())}>Today</button>}
+          {!isToday(date)&&<button style={{background:C.aDim,border:`1px solid ${C.aMid}`,color:C.accent,borderRadius:20,fontSize:11,fontWeight:500,padding:"3px 12px"}} onClick={()=>setDate(new Date())}>← Back to today</button>}
         </div>
         <button style={{width:34,height:34,borderRadius:10,background:C.hover,border:`1px solid ${C.border}`,color:C.sub,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>shift(1)}><IcRight/></button>
       </div>
     </div>
 
-    <div style={{display:"flex",gap:10,padding:"0 16px 16px"}}>
-      <div style={{flex:1,minWidth:0,overflow:"hidden",display:"flex",flexDirection:"column",gap:3,padding:"16px 18px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:18}}>
-        <span style={{fontSize:9,fontWeight:400,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:2}}>Calories</span>
-        <div style={{display:"flex",alignItems:"baseline",gap:3,flexWrap:"wrap"}}>
-          <span style={{fontSize:26,fontWeight:200,color:C.text,letterSpacing:"-1.5px",lineHeight:1}}>{eaten}</span>
-          <span style={{fontSize:16,color:C.dim,fontWeight:300,margin:"0 2px"}}>/</span>
-          {editGoal
-            ?<input autoFocus type="number" inputMode="numeric" style={{background:"transparent",border:"none",borderBottom:`2px solid ${C.accent}`,color:C.text,fontSize:22,fontWeight:200,fontFamily:"'Inter',sans-serif",letterSpacing:"-0.5px",outline:"none",padding:0,width:80,lineHeight:1}} value={goalVal} onChange={e=>setGoalVal(e.target.value)} onBlur={commitGoal} onKeyDown={e=>e.key==="Enter"&&commitGoal()}/>
-            :<span style={{fontSize:20,fontWeight:200,color:C.sub,letterSpacing:"-0.5px",cursor:"pointer",lineHeight:1}} onClick={()=>{setGoalVal(String(baseGoal));setEditGoal(true);}}>{goal}</span>
-          }
-          {!editGoal&&<span style={{color:C.dim,cursor:"pointer",display:"inline-flex",alignItems:"center",marginLeft:2}} onClick={()=>{setGoalVal(String(baseGoal));setEditGoal(true);}}><IcEdit/></span>}
+    <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={async e=>{
+      const f=e.target.files[0]; e.target.value=""; if(!f) return;
+      const r=await fileToImageData(f);
+      if(r) onOpenCamera(r.imageData, r.preview);
+    }}/>
+
+    {/* ── Calories + macros, full width ── */}
+    <div style={{padding:"0 16px 12px"}}>
+      <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:20,padding:"18px 20px"}}>
+        <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between",marginBottom:12}}>
+          <div>
+            <span style={{fontSize:10,fontWeight:400,color:C.dim,textTransform:"uppercase",letterSpacing:"1px"}}>Calories</span>
+            <div style={{display:"flex",alignItems:"baseline",gap:5,marginTop:4}}>
+              <span style={{fontSize:38,fontWeight:200,color:C.text,letterSpacing:"-2px",lineHeight:1}}>{eaten}</span>
+              <span style={{fontSize:18,color:C.dim,fontWeight:300}}>/</span>
+              {editGoal
+                ?<input autoFocus type="number" inputMode="numeric" style={{background:"transparent",border:"none",borderBottom:`2px solid ${C.accent}`,color:C.text,fontSize:24,fontWeight:200,fontFamily:"'Inter',sans-serif",letterSpacing:"-0.5px",outline:"none",padding:0,width:80,lineHeight:1}} value={goalVal} onChange={e=>setGoalVal(e.target.value)} onBlur={commitGoal} onKeyDown={e=>e.key==="Enter"&&commitGoal()}/>
+                :<span style={{fontSize:22,fontWeight:200,color:C.sub,letterSpacing:"-0.5px",cursor:"pointer"}} onClick={()=>{setGoalVal(String(baseGoal));setEditGoal(true);}}>{goal}</span>
+              }
+              {!editGoal&&<span style={{color:C.dim,cursor:"pointer",display:"inline-flex",marginLeft:2}} onClick={()=>{setGoalVal(String(baseGoal));setEditGoal(true);}}><IcEdit/></span>}
+            </div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <span style={{fontSize:20,fontWeight:200,color:overCal?C.orange:C.accent,letterSpacing:"-0.5px"}}>{overCal?"+":""}{Math.abs(remaining)}</span>
+            <p style={{fontSize:9,color:C.dim,fontWeight:300,textTransform:"uppercase",letterSpacing:"0.5px",marginTop:2}}>{overCal?"over":"left"}</p>
+          </div>
         </div>
-        <span style={{fontSize:9,color:C.dim,fontWeight:300,marginTop:1}}>{editGoal?"enter base goal + return":burned>0?`${baseGoal} + ${burned} burned`:"calories eaten / goal"}</span>
-        <div style={{marginTop:6,paddingTop:6,borderTop:`1px solid ${C.border}`,display:"flex",alignItems:"baseline",gap:4}}>
-          <span style={{fontSize:18,fontWeight:200,color:"#60C8F5",letterSpacing:"-0.5px",lineHeight:1}}>{protein}g</span>
-          <span style={{fontSize:9,color:C.dim,fontWeight:300,textTransform:"uppercase",letterSpacing:"0.5px"}}>protein</span>
+        <div style={{height:7,borderRadius:4,background:C.track,overflow:"hidden",marginBottom:6}}>
+          <div style={{width:`${calPct*100}%`,height:"100%",background:overCal?C.orange:C.accent,borderRadius:4,transition:"width 0.35s ease"}}/>
         </div>
-      </div>
-      <div style={{flex:1,minWidth:0,overflow:"hidden",display:"flex",flexDirection:"column",gap:3,padding:"16px 18px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:18}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:2}}>
-          <span style={{fontSize:9,fontWeight:400,color:C.dim,textTransform:"uppercase",letterSpacing:"1px"}}>Weight</span>
-          <button style={{background:"none",border:"none",color:C.dim,padding:0,display:"flex",alignItems:"center"}} onClick={onOpenWeightHistory}><IcRight/></button>
+        <p style={{fontSize:10,color:C.dim,fontWeight:300,marginBottom:14}}>{editGoal?"enter base goal, then return":burned>0?`${baseGoal} base + ${burned} burned`:"tap the goal to change it"}</p>
+        <div style={{display:"flex",gap:14}}>
+          <MacroMini label="Protein" value={protein} target={targets.protein} color={C.protein} onOpen={()=>onOpenMacro("protein")}/>
+          <MacroMini label="Carbs" value={carbs} target={targets.carbs} color={C.carbs} onOpen={()=>onOpenMacro("carbs")}/>
+          <MacroMini label="Fat" value={fat} target={targets.fat} color={C.fat} onOpen={()=>onOpenMacro("fat")}/>
         </div>
-        <div style={{display:"flex",alignItems:"baseline",gap:3}}>
-          {editWeight
-            ?<input autoFocus type="number" inputMode="decimal" style={{background:"transparent",border:"none",borderBottom:`2px solid ${C.accent}`,color:C.text,fontSize:26,fontWeight:200,fontFamily:"'Inter',sans-serif",letterSpacing:"-1.5px",outline:"none",padding:0,width:80,lineHeight:1}} placeholder="0" value={weightVal} onChange={e=>setWeightVal(e.target.value)} onBlur={commitWeight} onKeyDown={e=>e.key==="Enter"&&commitWeight()}/>
-            :<span style={{fontSize:26,fontWeight:200,color:C.text,letterSpacing:"-1.5px",lineHeight:1,cursor:"pointer"}} onClick={()=>{setWeightVal(latestW>0?String(latestW):"");setEditWeight(true);}}>{latestW>0?latestW:"—"}</span>
-          }
-          {!editWeight&&<span style={{color:C.dim,cursor:"pointer",display:"inline-flex",alignItems:"center",marginLeft:2}} onClick={()=>{setWeightVal(latestW>0?String(latestW):"");setEditWeight(true);}}><IcEdit/></span>}
-        </div>
-        <span style={{fontSize:9,color:C.dim,fontWeight:300,marginTop:1}}>{editWeight?"lbs, then return":"lbs"}</span>
-        {weightLog.length>=2&&<div style={{marginTop:4}}><WeightSparkline data={weightLog}/></div>}
       </div>
     </div>
 
-    <div style={{display:"flex",gap:10,padding:"0 16px 18px"}}>
-      <button style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",padding:"15px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:16,color:C.text}} onClick={()=>fileRef.current.click()}><IcCamera/></button>
-      <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={e=>{
-        const f=e.target.files[0]; if(!f) return;
-        const reader=new FileReader();
-        reader.onload=ev=>{
-          const img=new Image();
-          img.onload=()=>{
-            const MAX=1600;
-            let w=img.width, h=img.height;
-            if(w>MAX||h>MAX){ const s=Math.min(MAX/w,MAX/h); w=Math.round(w*s); h=Math.round(h*s); }
-            const canvas=document.createElement("canvas");
-            canvas.width=w; canvas.height=h;
-            canvas.getContext("2d").drawImage(img,0,0,w,h);
-            const dataUrl=canvas.toDataURL("image/jpeg",0.88);
-            onOpenCamera({base64:dataUrl.split(",")[1], mimeType:"image/jpeg"}, dataUrl);
-          };
-          img.src=ev.target.result;
-        };
-        reader.readAsDataURL(f); e.target.value="";
-      }}/>
-      <button style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",padding:"15px",background:C.aDim,border:`1px solid ${C.aMid}`,borderRadius:16,color:C.accent}} onClick={onOpenVoice}><IcMic/></button>
-      <button style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",padding:"15px",background:C.oDim,border:`1px solid ${C.oMid}`,borderRadius:16,color:C.orange,fontSize:22}} onClick={()=>setShowWorkout(true)}>🔥</button>
+    {/* ── Weight, full width ── */}
+    <div style={{padding:"0 16px 16px"}}>
+      <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:20,padding:"18px 20px"}}>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:10}}>
+          <div>
+            <span style={{fontSize:10,fontWeight:400,color:C.dim,textTransform:"uppercase",letterSpacing:"1px"}}>Weight</span>
+            <div style={{display:"flex",alignItems:"baseline",gap:6,marginTop:4}}>
+              {editWeight
+                ?<input autoFocus type="number" inputMode="decimal" style={{background:"transparent",border:"none",borderBottom:`2px solid ${C.accent}`,color:C.text,fontSize:32,fontWeight:200,fontFamily:"'Inter',sans-serif",letterSpacing:"-1.5px",outline:"none",padding:0,width:100,lineHeight:1}} placeholder="0" value={weightVal} onChange={e=>setWeightVal(e.target.value)} onBlur={commitWeight} onKeyDown={e=>e.key==="Enter"&&commitWeight()}/>
+                :<span style={{fontSize:32,fontWeight:200,color:C.text,letterSpacing:"-1.5px",lineHeight:1,cursor:"pointer"}} onClick={()=>{setWeightVal(latestW>0?String(latestW):"");setEditWeight(true);}}>{latestW>0?latestW:"—"}</span>
+              }
+              <span style={{fontSize:12,fontWeight:300,color:C.dim}}>lbs</span>
+              {!editWeight&&<span style={{color:C.dim,cursor:"pointer",display:"inline-flex"}} onClick={()=>{setWeightVal(latestW>0?String(latestW):"");setEditWeight(true);}}><IcEdit/></span>}
+              {weekDelta!==null&&!editWeight&&<span style={{fontSize:12,fontWeight:300,color:weekDelta<0?C.accent:C.orange,marginLeft:2}}>
+                {weekDelta<0?"↓":"↑"}{Math.abs(weekDelta)} / 7d
+              </span>}
+            </div>
+          </div>
+          <button style={{display:"flex",alignItems:"center",gap:3,background:"none",border:"none",color:C.dim,fontSize:11,padding:"4px 0"}} onClick={onOpenWeightHistory}>History <IcRight/></button>
+        </div>
+        {weightLog.length>=2
+          ? <WeightChart data={weightLog} height={58}/>
+          : <p style={{fontSize:11,fontWeight:300,color:C.dim,paddingTop:4}}>{editWeight?"lbs, then return":"Log two days to see the trend"}</p>}
+      </div>
     </div>
 
     <div style={{padding:"0 16px"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-        <span style={{fontSize:15,fontWeight:500,color:C.text}}>Meals & Workouts</span>
+        <span style={{fontSize:15,fontWeight:500,color:C.text}}>Meals & workouts</span>
         <span style={{fontSize:12,color:C.dim}}>{meals.length} {meals.length===1?"entry":"entries"}</span>
       </div>
       {meals.length===0
         ?<div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"48px 20px",gap:10}}>
           <span style={{fontSize:36}}>🍽️</span>
-          <p style={{color:C.sub,fontSize:14,textAlign:"center",lineHeight:1.6}}>Nothing logged yet.<br/>Tap 📷, 🎤, or 🔥 to get started.</p>
+          <p style={{color:C.sub,fontSize:14,textAlign:"center",lineHeight:1.6}}>Nothing logged yet.<br/>Say what you ate, snap a photo, or reuse a recent meal.</p>
         </div>
-        :[...meals].reverse().map(m=><MealCard key={m.id} meal={m} onTap={onSelectMeal}
-            onDelete={id=>onSelectMeal({...m,_delete:true})}
-            onQuickEdit={(id,cal)=>onSelectMeal({...m,_quickEdit:true,_newCal:cal})}/>)
+        :[...meals].reverse().map(m=><MealCard key={m.id} meal={m} onTap={onSelectMeal} onDelete={id=>onSelectMeal({...m,_delete:true})}/>)
       }
     </div>
     {showWorkout&&<WorkoutModal onAdd={w=>{onAddWorkout(w);setShowWorkout(false);}} onClose={()=>setShowWorkout(false)}/>}
+
+    {/* Docked action bar — fixed to the viewport so it stays under your thumb
+        no matter how far down the meal list you've scrolled. */}
+    <div style={{position:"fixed",left:0,right:0,bottom:0,zIndex:50,
+      padding:"10px 16px calc(env(safe-area-inset-bottom,12px) + 10px)",
+      background:`linear-gradient(180deg, rgba(10,10,15,0) 0%, ${C.bg} 22%)`}}>
+      <div style={{display:"flex",gap:8}}>
+        <ActionBtn onClick={onOpenDescribe} tone="accent" icon={<IcMic/>} label="Say it"/>
+        <ActionBtn onClick={()=>fileRef.current.click()} icon={<IcCamera/>} label="Photo"/>
+        <ActionBtn onClick={onOpenLibrary} icon={<IcStack/>} label="Recent"/>
+        <ActionBtn onClick={()=>setShowWorkout(true)} tone="orange" icon={<span style={{fontSize:22,lineHeight:"22px"}}>🔥</span>} label="Workout"/>
+      </div>
+    </div>
   </div>;
 }
 
-// ─── FIX 4: useWebSpeech now exposes the MediaStream so visualizer can use it ─
-// When SpeechRecognition is active, the mic is already open. We call getUserMedia
-// after a short delay (SpeechRecognition holds the grant), reusing the same
-// permission — browsers do NOT re-prompt if permission is already granted.
-function useWebSpeech(onUpdate) {
-  const recRef = useRef(null);
-  const [listening, setListening] = useState(false);
-  const supported = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
-
-  const start = useCallback(() => {
-    if (!supported) return;
-    try {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      const rec = new SR();
-      recRef.current = rec;
-      rec.continuous = true;
-      rec.interimResults = true;
-      rec.lang = "en-US";
-      let final = "";
-      rec.onresult = e => {
-        let interim = "";
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const t = e.results[i][0].transcript;
-          if (e.results[i].isFinal) final += t + " ";
-          else interim = t;
-        }
-        onUpdate(final + interim);
-      };
-      rec.onerror = () => setListening(false);
-      rec.onend = () => setListening(false);
-      rec.start();
-      setListening(true);
-      // NOTE: We intentionally do NOT call getUserMedia here.
-      // SpeechRecognition handles mic access on its own. A separate getUserMedia
-      // call triggers a second iOS permission prompt even when already granted.
-      // The visualizer uses animated bars instead — cosmetically identical.
-    } catch { setListening(false); }
-  }, [supported, onUpdate]);
-
-  const stop = useCallback(() => {
-    try { recRef.current?.stop(); } catch {}
-    setListening(false);
-  }, []);
-
-  return { listening, supported, start, stop, stream: null };
-}
-
-function VoiceScreen({apiKey,onBack,onAdd}) {
-  const [transcript,setTranscript]=useState("");
+/* Say the meal, land straight in its detail page to add items. */
+function DescribeScreen({apiKey,onBack,onAdd}) {
+  const [text,setText]=useState("");
   const [error,setError]=useState("");
   const [submitting,setSubmitting]=useState(false);
-  const [foodSugg,setFoodSugg]=useState([]);
-  const [showFoodSugg,setShowFoodSugg]=useState(false);
-  const foodHistRef=useRef(loadFoodHistory());
+  const baseRef=useRef("");
 
-  const onUpdate = useCallback(text => { setTranscript(text); }, []);
-  const speech = useWebSpeech(onUpdate);
+  const onUpdate=useCallback(t=>setText(baseRef.current+t),[]);
+  const speech=useWebSpeech(onUpdate);
+  const startMic=()=>{ baseRef.current = text ? text.replace(/\s+$/,"")+" " : ""; speech.start(); };
 
-  useEffect(() => {
-    if (speech.supported) setTimeout(() => speech.start(), 200);
-    return () => speech.stop();
-  }, []);
-
-  const handleChange = v => {
-    setTranscript(v);
-    const words = v.split(/[\s,]+/);
-    const last = words[words.length-1].trim();
-    if (last.length>=2) {
-      const m = foodHistRef.current.filter(f=>f.name.toLowerCase().includes(last.toLowerCase())).slice(0,4);
-      setFoodSugg(m); setShowFoodSugg(m.length>0);
-    } else setShowFoodSugg(false);
-  };
+  useEffect(()=>{
+    const id=setTimeout(()=>{ baseRef.current=""; speech.start(); },250);
+    return ()=>{ clearTimeout(id); speech.stop(); };
+  },[]);
 
   const submit = async () => {
-    if (!transcript.trim()) return;
+    if (!text.trim()) return;
     speech.stop();
     setSubmitting(true);
     try {
-      const r = await analyze(apiKey, null, transcript);
+      const r = await analyze(apiKey, null, text);
       const now = new Date();
-      onAdd({id:uid(),mealTitle:r.mealTitle,totalCalories:r.totalCalories,totalProteinG:r.totalProteinG||0,ingredients:r.ingredients||[],summary:r.summary,imageBase64:null,time:now.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}),addedAt:now.getTime(),emoji:r.emoji||"🍽️"});
-    } catch(e) { setError(e.message||"Error — check Settings ⚙️"); setSubmitting(false); }
+      onAdd({
+        id:uid(), mealTitle:r.mealTitle, totalCalories:r.totalCalories,
+        totalProteinG:r.totalProteinG||0, totalCarbsG:r.totalCarbsG||0, totalFatG:r.totalFatG||0,
+        ingredients:r.ingredients||[], summary:r.summary, imageBase64:null,
+        time:now.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}),
+        addedAt:now.getTime(), emoji:r.emoji||"🍽️"
+      });
+    } catch(e) { setError(e.message||"Something went wrong — check Settings ⚙️"); setSubmitting(false); }
   };
 
-  if (submitting) return <Spinner text="Calculating calories…"/>;
+  if (submitting) return <Spinner text="Building your meal…"/>;
 
   return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:40}}>
-    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"calc(env(safe-area-inset-top,44px) + 12px) 16px 12px"}}>
-      <button style={{width:44,height:44,borderRadius:12,background:C.hover,border:`1px solid ${C.border}`,color:C.text,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>{speech.stop();onBack();}}><IcBack/></button>
-      <span style={{fontSize:16,fontWeight:500,color:C.text}}>Voice Log</span>
-      <div style={{width:44}}/>
-    </div>
-    <div style={{display:"flex",flexDirection:"column",gap:16,padding:"8px 20px 40px"}}>
-      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:14,paddingTop:8}}>
-        <div onClick={speech.listening?speech.stop:speech.start}
-          style={{width:100,height:100,borderRadius:"50%",background:speech.listening?"rgba(255,68,68,0.12)":"rgba(74,230,138,0.1)",border:`2px solid ${speech.listening?C.red:C.accent}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.3s",boxShadow:speech.listening?"0 0 0 12px rgba(255,68,68,0.06)":"0 0 0 12px rgba(74,230,138,0.06)",animation:speech.listening?"ripple 1.5s ease-out infinite":"none"}}>
-          <div style={{color:speech.listening?C.red:C.accent}}>{speech.listening?<IcStop size={32}/>:<IcMic size={40}/>}</div>
+    <StickyHeader left={<HeaderBtn onClick={()=>{speech.stop();onBack();}}><IcBack/></HeaderBtn>} title="Say what you ate"/>
+    <div style={{display:"flex",flexDirection:"column",gap:14,padding:"12px 20px 40px"}}>
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:12,paddingTop:6}}>
+        <div onClick={speech.listening?speech.stop:startMic}
+          style={{width:96,height:96,borderRadius:"50%",background:speech.listening?"rgba(255,68,68,0.12)":"rgba(74,230,138,0.1)",border:`2px solid ${speech.listening?C.red:C.accent}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.3s",boxShadow:speech.listening?"0 0 0 12px rgba(255,68,68,0.06)":"0 0 0 12px rgba(74,230,138,0.06)"}}>
+          <div style={{color:speech.listening?C.red:C.accent}}>{speech.listening?<IcStop size={30}/>:<IcMic size={38}/>}</div>
         </div>
-        <p style={{fontSize:15,fontWeight:300,color:speech.listening?C.red:C.sub,textAlign:"center"}}>
-          {!speech.supported?"Type your meal below":speech.listening?"Listening… tap to stop":"Tap mic to speak"}
+        <p style={{fontSize:14,fontWeight:300,color:speech.listening?C.red:C.sub,textAlign:"center"}}>
+          {!speech.supported?"Type what you ate below":speech.listening?"Listening — tap to stop":"Tap to speak"}
         </p>
       </div>
-      <VoiceVisualizer active={speech.listening} mediaStream={speech.stream}/>
-      <div style={{position:"relative"}}>
-        <textarea style={{width:"100%",minHeight:110,background:C.surface,border:`1px solid ${transcript?C.aMid:C.border}`,borderRadius:14,color:transcript?C.text:C.sub,fontSize:14,padding:"14px 16px",resize:"none",outline:"none",fontFamily:"'Inter',sans-serif",lineHeight:1.65,transition:"border-color 0.2s"}}
-          placeholder={speech.supported?"Words appear here as you speak…\nOr type what you ate.":"Type what you ate (e.g. 'grilled chicken, rice, broccoli')"}
-          value={transcript} onChange={e=>handleChange(e.target.value)} onBlur={()=>setTimeout(()=>setShowFoodSugg(false),150)}/>
-        {showFoodSugg&&<div style={{position:"absolute",bottom:"100%",left:0,right:0,background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden",marginBottom:4,zIndex:10}}>
-          <p style={{fontSize:10,fontWeight:400,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",padding:"8px 14px 4px"}}>Previously logged</p>
-          {foodSugg.map((f,i)=><div key={i} onMouseDown={()=>{const w=transcript.split(/[\s,]+/);w[w.length-1]=f.name;setTranscript(w.join(" ")+` (${f.calories} cal)`);setShowFoodSugg(false);}} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderTop:`1px solid ${C.border}`,cursor:"pointer"}}>
-            <span style={{fontSize:14,color:C.text}}>{f.name}</span>
-            <span style={{fontSize:13,fontWeight:400,color:C.accent}}>{f.calories} cal</span>
-          </div>)}
-        </div>}
-      </div>
-      {error&&<p style={{color:C.red,fontSize:13,textAlign:"center",lineHeight:1.5}}>{error}</p>}
-      <div style={{display:"flex",gap:10}}>
-        {speech.listening&&<button style={{flexShrink:0,background:C.rDim,border:`2px solid ${C.red}`,borderRadius:14,color:C.red,fontSize:13,fontWeight:500,padding:"16px 14px",display:"flex",alignItems:"center",gap:6}} onClick={speech.stop}><IcStop size={14}/> Stop</button>}
-        <button style={{flex:1,background:C.accent,border:"none",borderRadius:14,color:C.bg,fontSize:15,fontWeight:500,padding:"16px",opacity:transcript.trim()?1:0.3}} onClick={submit} disabled={!transcript.trim()}>Add to Log →</button>
-      </div>
+      <ListeningBars active={speech.listening}/>
+      <textarea style={{width:"100%",minHeight:100,background:C.surface,border:`1px solid ${text?C.aMid:C.border}`,borderRadius:14,color:text?C.text:C.sub,fontSize:15,padding:"14px 16px",resize:"none",outline:"none",fontFamily:"'Inter',sans-serif",lineHeight:1.65,transition:"border-color 0.2s"}}
+        placeholder={speech.supported?"Words appear here as you speak — e.g. \"a salad with chicken\"":"e.g. a salad with chicken"}
+        value={text} onChange={e=>setText(e.target.value)}/>
+      <p style={{fontSize:11,fontWeight:300,color:C.dim,lineHeight:1.6,textAlign:"center"}}>You'll land on the meal page next, where you can photograph each item.</p>
+      {error&&<div style={{background:C.rDim,border:`1px solid ${C.rMid}`,borderRadius:12,padding:"12px 14px"}}>
+        <p style={{color:C.red,fontSize:13,fontWeight:500,lineHeight:1.5}}>⚠ {error}</p>
+      </div>}
+      <button style={{width:"100%",background:C.accent,border:"none",borderRadius:14,color:C.bg,fontSize:15,fontWeight:500,padding:"16px",opacity:text.trim()?1:0.3}} onClick={submit} disabled={!text.trim()}>
+        {error?"Try again →":"Create meal →"}
+      </button>
     </div>
   </div>;
 }
@@ -757,10 +1020,12 @@ function PhotoScreen({apiKey,imageData,imagePreview,onBack,onAdd}) {
   const [note,setNote]=useState("");
   const [error,setError]=useState("");
   const [submitting,setSubmitting]=useState(false);
+  const baseRef=useRef("");
 
-  const onUpdate = useCallback(text => setNote(text), []);
-  const speech = useWebSpeech(onUpdate);
-  useEffect(() => () => speech.stop(), []);
+  const onUpdate=useCallback(t=>setNote(baseRef.current+t),[]);
+  const speech=useWebSpeech(onUpdate);
+  const startMic=()=>{ baseRef.current = note ? note.replace(/\s+$/,"")+" " : ""; speech.start(); };
+  useEffect(()=>()=>speech.stop(),[]);
 
   const submit = async () => {
     speech.stop();
@@ -771,9 +1036,9 @@ function PhotoScreen({apiKey,imageData,imagePreview,onBack,onAdd}) {
       const now = new Date();
       onAdd({
         id:uid(), mealTitle:r.mealTitle, totalCalories:r.totalCalories,
-        totalProteinG:r.totalProteinG||0, ingredients:r.ingredients||[],
-        summary:r.summary, imageBase64:imageData?.base64||null,
-        imageMime:imageData?.mimeType||"image/jpeg",
+        totalProteinG:r.totalProteinG||0, totalCarbsG:r.totalCarbsG||0, totalFatG:r.totalFatG||0,
+        ingredients:r.ingredients||[], summary:r.summary,
+        imageBase64:imageData?.base64||null, imageMime:imageData?.mimeType||"image/jpeg",
         time:now.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}),
         addedAt:now.getTime(), emoji:r.emoji||null
       });
@@ -788,40 +1053,36 @@ function PhotoScreen({apiKey,imageData,imagePreview,onBack,onAdd}) {
   return <div style={{height:"100%",background:C.bg,display:"flex",flexDirection:"column"}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"calc(env(safe-area-inset-top,44px) + 8px) 16px 8px",flexShrink:0}}>
       <button style={{width:40,height:40,borderRadius:11,background:C.hover,border:`1px solid ${C.border}`,color:C.text,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>{speech.stop();onBack();}}><IcBack/></button>
-      <span style={{fontSize:16,fontWeight:500,color:C.text}}>Add Meal Photo</span>
+      <span style={{fontSize:16,fontWeight:500,color:C.text}}>Add meal photo</span>
       <div style={{width:40}}/>
     </div>
     {imagePreview&&<div style={{flex:1,minHeight:0,padding:"0 16px 8px"}}>
       <img src={imagePreview} style={{width:"100%",height:"100%",objectFit:"cover",borderRadius:16,border:`1px solid ${C.border}`,display:"block"}} alt=""/>
     </div>}
     <div style={{flexShrink:0,padding:"0 16px calc(env(safe-area-inset-bottom,16px) + 12px)",display:"flex",flexDirection:"column",gap:8}}>
-      {speech.supported&&(
-        <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:C.surface,borderRadius:14,border:`1px solid ${C.border}`}}>
-          <div onClick={speech.listening?speech.stop:speech.start}
-            style={{width:40,height:40,borderRadius:"50%",flexShrink:0,background:speech.listening?"rgba(255,68,68,0.12)":"rgba(74,230,138,0.1)",border:`2px solid ${speech.listening?C.red:C.accent}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.3s"}}>
-            <div style={{color:speech.listening?C.red:C.accent}}>{speech.listening?<IcStop size={14}/>:<IcMic size={18}/>}</div>
-          </div>
-          {speech.listening
-            ?<div style={{flex:1,height:36}}><VoiceVisualizer active={true} mediaStream={speech.stream}/></div>
-            :<span style={{flex:1,fontSize:13,color:C.sub}}>Tap mic to add voice notes (optional)</span>
-          }
+      {speech.supported&&<div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:C.surface,borderRadius:14,border:`1px solid ${C.border}`}}>
+        <div onClick={speech.listening?speech.stop:startMic}
+          style={{width:40,height:40,borderRadius:"50%",flexShrink:0,background:speech.listening?"rgba(255,68,68,0.12)":"rgba(74,230,138,0.1)",border:`2px solid ${speech.listening?C.red:C.accent}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.3s"}}>
+          <div style={{color:speech.listening?C.red:C.accent}}>{speech.listening?<IcStop size={14}/>:<IcMic size={18}/>}</div>
         </div>
-      )}
-      <textarea style={{width:"100%",height:68,background:C.surface,border:`1px solid ${note?C.aMid:C.border}`,borderRadius:12,color:note?C.text:C.sub,fontSize:13,padding:"10px 14px",resize:"none",outline:"none",fontFamily:"'Inter',sans-serif",lineHeight:1.55}}
-        placeholder="Add notes (optional) — ingredients, portions, brand…"
+        {speech.listening
+          ?<div style={{flex:1,height:36}}><ListeningBars active={true}/></div>
+          :<span style={{flex:1,fontSize:13,color:C.sub}}>Tap to add voice notes (optional)</span>
+        }
+      </div>}
+      <textarea style={{width:"100%",height:60,background:C.surface,border:`1px solid ${note?C.aMid:C.border}`,borderRadius:12,color:note?C.text:C.sub,fontSize:13,padding:"10px 14px",resize:"none",outline:"none",fontFamily:"'Inter',sans-serif",lineHeight:1.55}}
+        placeholder="Notes (optional) — ingredients, portions, brand…"
         value={note} onChange={e=>setNote(e.target.value)}/>
       {error&&<div style={{background:C.rDim,border:`1px solid ${C.rMid}`,borderRadius:12,padding:"12px 14px",marginBottom:2}}>
         <p style={{color:C.red,fontSize:13,fontWeight:600,lineHeight:1.5}}>⚠ {error}</p>
       </div>}
       <button style={{width:"100%",background:C.accent,border:"none",borderRadius:13,color:C.bg,fontSize:15,fontWeight:500,padding:"14px"}} onClick={submit}>
-        {error?"Retry →":"Analyze & Add →"}
+        {error?"Try again →":"Analyze & add →"}
       </button>
     </div>
   </div>;
 }
 
-// Each ingredient stores: name, calories (current total), proteinG (current total),
-// baseCalories (per-serving), baseProteinG (per-serving), servings (float)
 function SwipeIngRow({ing,idx,editIdx,editField,servVal,calVal,setServVal,setCalVal,setEditIdx,commitServ,commitCal,onDelete}) {
   const [swipeX,setSwipeX]=useState(0);const[swiping,setSwiping]=useState(false);
   const tx=useRef(0),ty=useRef(0);const THRESHOLD=70;
@@ -829,9 +1090,9 @@ function SwipeIngRow({ing,idx,editIdx,editField,servVal,calVal,setServVal,setCal
   const onTM=e=>{const dx=e.touches[0].clientX-tx.current;const dy=Math.abs(e.touches[0].clientY-ty.current);if(dy>20&&Math.abs(dx)<20)return;if(dx<-8){setSwiping(true);setSwipeX(Math.max(dx,-(THRESHOLD+20)));}};
   const onTE=e=>{
     const dx=Math.abs(e.changedTouches[0].clientX-tx.current);
-    if(dx<8){setSwipeX(0);setSwiping(false);return;} // it was a tap, not a swipe
+    if(dx<8){setSwipeX(0);setSwiping(false);return;}
     if(swipeX<=-THRESHOLD)onDelete(idx);else{setSwipeX(0);setSwiping(false);}
-  };;
+  };
   const servings = ing.servings ?? 1;
   const editingServ = editIdx===idx && editField==="serv";
   const editingCal  = editIdx===idx && editField==="cal";
@@ -841,10 +1102,8 @@ function SwipeIngRow({ing,idx,editIdx,editField,servVal,calVal,setServVal,setCal
     </div>
     <div style={{padding:"10px 16px",background:C.surface,transform:`translateX(${swipeX}px)`,transition:swiping?"none":"transform 0.3s ease"}}
       onTouchStart={onTS} onTouchMove={onTM} onTouchEnd={onTE}>
-      {/* Name — small, light */}
       <p style={{fontSize:11,fontWeight:300,color:C.sub,marginBottom:6,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ing.name}</p>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        {/* Servings — tappable */}
         <div style={{display:"flex",alignItems:"baseline",gap:4,cursor:"pointer"}}
           onClick={e=>{e.stopPropagation();if(!editingServ){setEditIdx(idx,"serv");setServVal(String(servings));}}}>
           <span style={{fontSize:10,fontWeight:300,color:C.dim,marginRight:2}}>SRV</span>
@@ -857,7 +1116,6 @@ function SwipeIngRow({ing,idx,editIdx,editField,servVal,calVal,setServVal,setCal
           }
           {!editingServ&&<span style={{color:C.dim,display:"inline-flex",alignItems:"center",marginLeft:2}}><IcEdit size={11}/></span>}
         </div>
-        {/* Calories — tappable */}
         <div style={{display:"flex",alignItems:"baseline",gap:4,cursor:"pointer"}}
           onClick={e=>{e.stopPropagation();if(!editingCal){setEditIdx(idx,"cal");setCalVal(String(ing.calories));}}}>
           <span style={{fontSize:10,fontWeight:300,color:C.dim,marginRight:2}}>CAL</span>
@@ -869,73 +1127,139 @@ function SwipeIngRow({ing,idx,editIdx,editField,servVal,calVal,setServVal,setCal
             :<span style={{fontSize:22,fontWeight:200,color:C.accent,letterSpacing:"-0.5px"}}>{ing.calories}</span>
           }
           {!editingCal&&<span style={{color:C.dim,display:"inline-flex",alignItems:"center",marginLeft:2}}><IcEdit size={11}/></span>}
-          {(ing.proteinG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:"rgba(96,200,245,0.6)",marginLeft:6}}>{Math.round(ing.proteinG)}g pro</span>}
         </div>
+      </div>
+      <div style={{display:"flex",gap:10,marginTop:4}}>
+        {(ing.proteinG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:C.protein}}>{Math.round(ing.proteinG)}g protein</span>}
+        {(ing.carbsG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:C.carbs}}>{Math.round(ing.carbsG)}g carbs</span>}
+        {(ing.fatG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:C.fat}}>{Math.round(ing.fatG)}g fat</span>}
       </div>
     </div>
   </div>;
 }
 
-function DetailScreen({meal,onBack,onUpdate,onDelete,apiKey}) {
-  // Parse servings hints from ingredient names like "1.5 servings of balsamic dressing"
-  const parseServings = ing => {
-    if (ing.servings != null && ing.servings !== 1) return ing; // already set
-    const m = ing.name.match(/^([\d.\/]+)\s*(?:servings?|srv|x)\s+(?:of\s+)?/i);
-    if (m) {
-      const n = parseFloat(m[1]);
-      if (!isNaN(n) && n > 0 && n !== 1) {
-        const baseCal = ing.baseCalories ?? Math.round(ing.calories / n);
-        const baseProt = ing.baseProteinG ?? Math.round(((ing.proteinG||0) / n)*10)/10;
-        return {...ing, servings:n, baseCalories:baseCal, baseProteinG:baseProt};
-      }
-    }
+const r1 = n => Math.round(n*10)/10;
+
+/* Pull a count out of a name like "Crunchy Taco x2" or "2 servings of rice".
+   Returns the count and the name with the quantity stripped off. */
+function inferServings(name) {
+  const n = name || "";
+  let m = n.match(/^([\d.]+)\s*(?:servings?|srv)\s+(?:of\s+)?/i);
+  if (m) return { n: parseFloat(m[1]), name: n.slice(m[0].length).trim() };
+  m = n.match(/^(\d+(?:\.\d+)?)\s*[x×]\s+/i);
+  if (m) return { n: parseFloat(m[1]), name: n.slice(m[0].length).trim() };
+  m = n.match(/\s*[x×]\s*(\d+(?:\.\d+)?)\s*$/i);
+  if (m) return { n: parseFloat(m[1]), name: n.slice(0, m.index).trim() };
+  return { n: 1, name: n };
+}
+
+/* Two different inputs arrive here and they mean opposite things:
+   - servings supplied by the API: per-unit values, so multiply up to get totals.
+   - a count found only in the name (older meals): the numbers are ALREADY the
+     combined total, so divide down to get the per-unit base.
+   Getting these backwards is what silently doubles or halves a meal. */
+const normalise = ings => (ings||[]).map(raw => {
+  const ing = {...raw, proteinG: raw.proteinG||0, carbsG: raw.carbsG||0, fatG: raw.fatG||0};
+  const given = Number(ing.servings);
+  const info = inferServings(ing.name || "");
+  ing.name = info.name || ing.name;
+
+  if (ing.baseCalories != null) {           // already normalised previously
+    ing.servings = given > 0 ? given : 1;
+    ing.baseProteinG = ing.baseProteinG ?? 0;
+    ing.baseCarbsG   = ing.baseCarbsG   ?? 0;
+    ing.baseFatG     = ing.baseFatG     ?? 0;
     return ing;
-  };
-  const normalise = ings => ings.map(ing=>parseServings({
-    ...ing,
-    baseCalories: ing.baseCalories ?? ing.calories,
-    baseProteinG: ing.baseProteinG ?? (ing.proteinG||0),
-    servings: ing.servings ?? 1,
-  }));
-  const [ings,setIngs]=useState(()=>normalise(meal.ingredients||[]));
+  }
+
+  if (given > 1) {                          // per-unit values + explicit count
+    ing.servings = given;
+    ing.baseCalories = ing.calories || 0;
+    ing.baseProteinG = ing.proteinG;
+    ing.baseCarbsG   = ing.carbsG;
+    ing.baseFatG     = ing.fatG;
+    ing.calories = Math.round(ing.baseCalories * given);
+    ing.proteinG = r1(ing.baseProteinG * given);
+    ing.carbsG   = r1(ing.baseCarbsG   * given);
+    ing.fatG     = r1(ing.baseFatG     * given);
+    return ing;
+  }
+
+  if (info.n > 1) {                         // count only in the name — totals already combined
+    ing.servings = info.n;
+    ing.baseCalories = Math.round((ing.calories||0) / info.n);
+    ing.baseProteinG = r1(ing.proteinG / info.n);
+    ing.baseCarbsG   = r1(ing.carbsG   / info.n);
+    ing.baseFatG     = r1(ing.fatG     / info.n);
+    return ing;
+  }
+
+  ing.servings = 1;
+  ing.baseCalories = ing.calories || 0;
+  ing.baseProteinG = ing.proteinG;
+  ing.baseCarbsG   = ing.carbsG;
+  ing.baseFatG     = ing.fatG;
+  return ing;
+});
+
+function DetailScreen({meal,onBack,onUpdate,onDelete,apiKey}) {
+  const [ings,setIngs]=useState(()=>normalise(meal.ingredients));
   const [editTotal,setEditTotal]=useState(false);
   const [totalVal,setTotalVal]=useState(String(meal.totalCalories));
+  const [editTitle,setEditTitle]=useState(false);
+  const [titleVal,setTitleVal]=useState(meal.mealTitle);
   const [editIdx,setEditIdx]=useState(null);
-  const [editField,setEditField]=useState(null); // "serv" | "cal"
+  const [editField,setEditField]=useState(null);
   const [servVal,setServVal]=useState("");
   const [calVal,setCalVal]=useState("");
-  const [addingVoice,setAddingVoice]=useState(false);
-  const [addTranscript,setAddTranscript]=useState("");
+  const [adding,setAdding]=useState(false);
+  const [addText,setAddText]=useState("");
   const [addError,setAddError]=useState("");
   const [addLoading,setAddLoading]=useState(false);
+  const [busyMsg,setBusyMsg]=useState("");
+  const [lightbox,setLightbox]=useState(false);
+  const [recent,setRecent]=useState(()=>loadItems().sort(itemSort).slice(0,8));
   const isWorkout=meal.type==="workout";
+  const photoRef=useRef();
+  const baseRef=useRef("");
 
-  const setEditIdx2 = (idx, field) => { setEditIdx(idx); setEditField(field); };
-
-  const onUpdate2 = useCallback(t=>setAddTranscript(t),[]);
-  const speech = useWebSpeech(onUpdate2);
+  const onSpeechUpdate=useCallback(t=>setAddText(baseRef.current+t),[]);
+  const speech=useWebSpeech(onSpeechUpdate);
+  const startMic=()=>{ baseRef.current = addText ? addText.replace(/\s+$/,"")+" " : ""; speech.start(); };
   useEffect(()=>()=>speech.stop(),[]);
 
-  const save = (newIngs) => {
-    const newTot = Math.round(newIngs.reduce((s,x)=>s+x.calories,0));
-    const newProt = newIngs.reduce((s,x)=>s+(x.proteinG||0),0);
-    setTotalVal(String(newTot));
-    onUpdate({...meal, totalCalories:newTot, totalProteinG:newProt, ingredients:newIngs});
+  const setEditIdx2 = (idx, field) => { setEditIdx(idx); setEditField(field); };
+  const sumCal = ings.reduce((s,x)=>s+(x.calories||0),0);
+  const inSync = ings.length>0 && Math.round(sumCal)===meal.totalCalories;
+
+  const save = (newIngs, extra={}) => {
+    const tot = Math.round(newIngs.reduce((s,x)=>s+(x.calories||0),0));
+    setTotalVal(String(tot));
+    onUpdate({...meal, ...extra,
+      totalCalories: tot,
+      totalProteinG: newIngs.reduce((s,x)=>s+(x.proteinG||0),0),
+      totalCarbsG:   newIngs.reduce((s,x)=>s+(x.carbsG||0),0),
+      totalFatG:     newIngs.reduce((s,x)=>s+(x.fatG||0),0),
+      ingredients: newIngs});
   };
 
+  const commitTitle = () => {
+    const t = titleVal.trim();
+    if (t) onUpdate({...meal, mealTitle:t, ingredients:ings});
+    else setTitleVal(meal.mealTitle);
+    setEditTitle(false);
+  };
   const commitTotal=()=>{const n=parseInt(totalVal);if(!isNaN(n)&&n>=0)onUpdate({...meal,totalCalories:n,ingredients:ings});else setTotalVal(String(meal.totalCalories));setEditTotal(false);};
 
   const commitServ = idx => {
     const n = parseFloat(servVal);
     if (!isNaN(n) && n > 0) {
-      const next = ings.map((x,i) => {
-        if (i !== idx) return x;
-        const newCal = Math.round(x.baseCalories * n);
-        const newProt = Math.round((x.baseProteinG||0) * n * 10) / 10;
-        return {...x, servings:n, calories:newCal, proteinG:newProt};
-      });
-      setIngs(next);
-      save(next);
+      const next = ings.map((x,i) => i!==idx ? x : ({...x, servings:n,
+        calories: Math.round(x.baseCalories*n),
+        proteinG: Math.round((x.baseProteinG||0)*n*10)/10,
+        carbsG:   Math.round((x.baseCarbsG||0)*n*10)/10,
+        fatG:     Math.round((x.baseFatG||0)*n*10)/10}));
+      setIngs(next); save(next);
     }
     setEditIdx(null); setEditField(null);
   };
@@ -943,93 +1267,551 @@ function DetailScreen({meal,onBack,onUpdate,onDelete,apiKey}) {
   const commitCal = idx => {
     const n = parseInt(calVal);
     if (!isNaN(n) && n >= 0) {
-      const next = ings.map((x,i) => {
-        if (i !== idx) return x;
-        // Update base calories too so future serving changes stay accurate
-        const newBase = x.servings > 0 ? Math.round(n / x.servings) : n;
-        return {...x, calories:n, baseCalories:newBase};
-      });
-      setIngs(next);
-      save(next);
+      const next = ings.map((x,i) => i!==idx ? x : ({...x, calories:n, baseCalories: x.servings>0 ? Math.round(n/x.servings) : n}));
+      setIngs(next); save(next);
     }
     setEditIdx(null); setEditField(null);
   };
 
-  const mergeItems = async () => {
-    if (!addTranscript.trim()) return;
+  const appendIngredients = (raw, extra={}) => {
+    const added = normalise(raw);
+    const next = [...ings, ...added];
+    recordItems(added);
+    setRecent(loadItems().sort(itemSort).slice(0,8));
+    setIngs(next);
+    save(next, extra);
+  };
+
+  // Reuse a past item — no API call, instant.
+  const addRecent = it => {
+    appendIngredients([{name:it.name,calories:it.calories,proteinG:it.proteinG,carbsG:it.carbsG,fatG:it.fatG}]);
+  };
+
+  const addByText = async () => {
+    if (!addText.trim()) return;
     speech.stop();
-    setAddLoading(true);
-    setAddError("");
+    setAddLoading(true); setAddError("");
     try {
-      const r = await analyze(apiKey, null, addTranscript);
-      const raw = r.ingredients||[{name:r.mealTitle,calories:r.totalCalories,proteinG:r.totalProteinG||0}];
-      const newIngs = [...ings, ...normalise(raw)];
-      setIngs(newIngs);
-      save(newIngs);
-      setAddTranscript("");
-      setAddingVoice(false);
-    } catch(e) { setAddError(e.message||"Error — try again"); }
+      const r = await analyze(apiKey, null, addText);
+      const raw = r.ingredients?.length ? r.ingredients : [{name:r.mealTitle,calories:r.totalCalories,proteinG:r.totalProteinG||0,carbsG:r.totalCarbsG||0,fatG:r.totalFatG||0}];
+      const extra = {};
+      if (!meal.emoji || meal.mealTitle === "New meal") extra.emoji = r.emoji || meal.emoji;
+      appendIngredients(raw, extra);
+      setAddText(""); setAdding(false);
+    } catch(e) { setAddError(e.message||"Couldn't add that — try again"); }
     setAddLoading(false);
   };
 
+  const addByPhoto = async file => {
+    setBusyMsg("Analyzing item…");
+    try {
+      const shot = await fileToImageData(file);
+      if (!shot) { setBusyMsg(""); setAddError("Couldn't read that photo"); return; }
+      const r = await analyze(apiKey, shot.imageData, null);
+      const raw = r.ingredients?.length ? r.ingredients : [{name:r.mealTitle,calories:r.totalCalories,proteinG:r.totalProteinG||0,carbsG:r.totalCarbsG||0,fatG:r.totalFatG||0}];
+      const extra = {};
+      if (!meal.imageBase64) {
+        const thumb = await makeThumbnail(shot.imageData.base64, "image/jpeg");
+        if (thumb) { extra.imageBase64 = thumb; extra.imageMime = "image/jpeg"; }
+      }
+      if (!meal.emoji || meal.mealTitle === "New meal") extra.emoji = r.emoji || meal.emoji;
+      appendIngredients(raw, extra);
+    } catch(e) { setAddError(e.message||"Couldn't analyze that photo"); }
+    setBusyMsg("");
+  };
+
+  if (busyMsg) return <Spinner text={busyMsg}/>;
+
+  if (lightbox && meal.imageBase64) return <div
+    style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.94)",zIndex:200,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"20px"}}
+    onClick={()=>setLightbox(false)}>
+    <img src={`data:${meal.imageMime||"image/jpeg"};base64,${meal.imageBase64}`}
+      style={{maxWidth:"100%",maxHeight:"82%",objectFit:"contain",borderRadius:12,display:"block"}} alt=""/>
+    <button style={{marginTop:22,background:C.hover,border:`1px solid ${C.border}`,borderRadius:12,color:C.text,fontSize:14,fontWeight:400,padding:"12px 28px"}}
+      onClick={()=>setLightbox(false)}>Close</button>
+  </div>;
+
   return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:48}}>
-    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"calc(env(safe-area-inset-top,44px) + 12px) 16px 12px"}}>
-      <button style={{width:44,height:44,borderRadius:12,background:C.hover,border:`1px solid ${C.border}`,color:C.text,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onBack}><IcBack/></button>
-      <span style={{fontSize:16,fontWeight:500,color:C.text}}>{isWorkout?"Workout":"Meal Details"}</span>
-      <button style={{width:44,height:44,borderRadius:12,background:C.rDim,border:`1px solid ${C.rMid}`,color:C.red,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>onDelete(meal.id)}><IcTrash/></button>
-    </div>
-    {!isWorkout&&(meal.imageBase64?<img src={`data:${meal.imageMime||"image/jpeg"};base64,${meal.imageBase64}`} style={{width:"100%",height:250,objectFit:"cover"}} alt=""/>:<div style={{width:"100%",height:180,background:C.surface,display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:56}}>{meal.emoji||"🍽️"}</span></div>)}
-    {isWorkout&&<div style={{width:"100%",height:140,background:C.oDim,display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:64}}>🔥</span></div>}
-    <div style={{padding:"20px 20px 40px"}}>
-      <h2 style={{fontSize:22,fontWeight:400,color:isWorkout?C.orange:C.text,marginBottom:6,letterSpacing:"-0.3px"}}>{meal.mealTitle}</h2>
-      <p style={{fontSize:13,fontWeight:300,color:C.sub,lineHeight:1.6,marginBottom:5}}>{meal.summary}</p>
-      <p style={{fontSize:11,color:C.dim,marginBottom:20}}>{meal.time}</p>
-      <div style={{display:"flex",gap:10,marginBottom:18}}>
-        <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"16px 18px",background:isWorkout?C.oDim:C.aDim,border:`1px solid ${isWorkout?C.oMid:C.aMid}`,borderRadius:16,cursor:"pointer"}} onClick={()=>{setTotalVal(String(meal.totalCalories));setEditTotal(true);}}>
-          <span style={{fontSize:13,fontWeight:400,color:C.text}}>{isWorkout?"Calories Burned":"Calories"}</span>
+    <StickyHeader
+      left={<HeaderBtn onClick={onBack}><IcBack/></HeaderBtn>}
+      title={isWorkout?"Workout":"Meal details"}
+      right={<HeaderBtn tone="danger" onClick={()=>onDelete(meal.id)}><IcTrash/></HeaderBtn>}
+    />
+    {isWorkout&&<div style={{width:"100%",height:110,background:C.oDim,display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:52}}>🔥</span></div>}
+
+    <div style={{padding:"18px 20px 40px"}}>
+      {/* Thumbnail sits beside the title instead of eating a third of the screen.
+          Tap it for the full-size view. */}
+      <div style={{display:"flex",gap:14,alignItems:"flex-start",marginBottom:14}}>
+        {!isWorkout&&<div style={{flexShrink:0,position:"relative",cursor:meal.imageBase64?"pointer":"default"}}
+          onClick={()=>{ if(meal.imageBase64) setLightbox(true); }}>
+          {meal.imageBase64
+            ?<>
+              <img src={`data:${meal.imageMime||"image/jpeg"};base64,${meal.imageBase64}`}
+                style={{width:84,height:84,borderRadius:14,objectFit:"cover",display:"block",border:`1px solid ${C.border}`}} alt=""/>
+              <div style={{position:"absolute",bottom:4,right:4,background:"rgba(10,10,15,0.8)",borderRadius:6,padding:"2px 5px"}}>
+                <span style={{fontSize:8,fontWeight:400,color:C.text}}>TAP</span>
+              </div>
+            </>
+            :<div style={{width:84,height:84,borderRadius:14,background:C.surface,border:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"center"}}>
+              <span style={{fontSize:34}}>{meal.emoji||"🍽️"}</span>
+            </div>}
+        </div>}
+        <div style={{flex:1,minWidth:0}}>
+          {editTitle
+            ?<input autoFocus value={titleVal} onChange={e=>setTitleVal(e.target.value)} onBlur={commitTitle} onKeyDown={e=>e.key==="Enter"&&commitTitle()}
+               style={{width:"100%",background:"transparent",border:"none",borderBottom:`2px solid ${C.accent}`,color:C.text,fontSize:19,fontWeight:400,fontFamily:"'Inter',sans-serif",letterSpacing:"-0.3px",outline:"none",padding:"0 0 4px",marginBottom:6}}/>
+            :<h2 style={{fontSize:19,fontWeight:400,color:isWorkout?C.orange:C.text,marginBottom:5,letterSpacing:"-0.3px",lineHeight:1.3,cursor:"pointer"}}
+               onClick={()=>{setTitleVal(meal.mealTitle);setEditTitle(true);}}>
+               {meal.mealTitle}<span style={{color:C.dim,display:"inline-flex",marginLeft:7,verticalAlign:"middle"}}><IcEdit size={13}/></span>
+             </h2>
+          }
+          <p style={{fontSize:11,color:C.dim}}>{meal.time}</p>
+        </div>
+      </div>
+      {meal.summary&&<p style={{fontSize:12,fontWeight:300,color:C.sub,lineHeight:1.6,marginBottom:16}}>{meal.summary}</p>}
+
+      <div style={{display:"flex",flexDirection:"column",gap:4,padding:"14px 18px",background:isWorkout?C.oDim:C.aDim,border:`1px solid ${isWorkout?C.oMid:C.aMid}`,borderRadius:16,cursor:"pointer",marginBottom:10}} onClick={()=>{setTotalVal(String(meal.totalCalories));setEditTotal(true);}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <span style={{fontSize:13,fontWeight:400,color:C.text}}>{isWorkout?"Calories burned":"Calories"}</span>
           {editTotal
             ?<input autoFocus type="number" inputMode="numeric" style={{width:80,background:"transparent",border:"none",borderBottom:`2px solid ${isWorkout?C.orange:C.accent}`,color:isWorkout?C.orange:C.accent,fontSize:26,fontWeight:200,fontFamily:"'Inter',sans-serif",outline:"none",textAlign:"right"}} value={totalVal} onChange={e=>setTotalVal(e.target.value)} onBlur={commitTotal} onKeyDown={e=>e.key==="Enter"&&commitTotal()} onClick={e=>e.stopPropagation()}/>
             :<div style={{display:"flex",alignItems:"center",gap:5,color:isWorkout?C.orange:C.accent}}><span style={{fontSize:26,fontWeight:200,letterSpacing:"-1.5px"}}>{meal.totalCalories}</span><span style={{fontSize:11,opacity:0.7}}>kcal</span><IcEdit size={13}/></div>
           }
         </div>
-        {!isWorkout&&(meal.totalProteinG||0)>0&&<div style={{padding:"16px 14px",background:"rgba(96,200,245,0.1)",border:"1px solid rgba(96,200,245,0.3)",borderRadius:16,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minWidth:72}}>
-          <span style={{fontSize:20,fontWeight:200,color:"#60C8F5",letterSpacing:"-0.5px"}}>{Math.round(meal.totalProteinG||0)}g</span>
-          <span style={{fontSize:9,color:C.dim,textTransform:"uppercase",letterSpacing:"0.5px",marginTop:1}}>protein</span>
-        </div>}
+        {!isWorkout&&ings.length>0&&<span style={{fontSize:10,fontWeight:300,color:inSync?C.dim:C.orange}}>
+          {inSync ? `total of ${ings.length} ${ings.length===1?"item":"items"}` : `manual override · items total ${Math.round(sumCal)}`}
+        </span>}
       </div>
 
+      {!isWorkout&&<div style={{display:"flex",gap:8,marginBottom:18}}>
+        {[["Protein",meal.totalProteinG,C.protein],["Carbs",meal.totalCarbsG,C.carbs],["Fat",meal.totalFatG,C.fat]].map(([lbl,v,col])=>
+          <div key={lbl} style={{flex:1,padding:"12px 10px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,display:"flex",flexDirection:"column",alignItems:"center"}}>
+            <span style={{fontSize:18,fontWeight:200,color:col,letterSpacing:"-0.5px"}}>{Math.round(v||0)}g</span>
+            <span style={{fontSize:9,color:C.dim,textTransform:"uppercase",letterSpacing:"0.5px",marginTop:2}}>{lbl}</span>
+          </div>
+        )}
+      </div>}
+
       {!isWorkout&&<div style={{background:C.surface,borderRadius:16,border:`1px solid ${C.border}`,overflow:"hidden",marginBottom:12}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px 8px"}}>
-          <p style={{fontSize:11,fontWeight:400,color:C.sub,textTransform:"uppercase",letterSpacing:"1.2px"}}>Breakdown</p>
-          {!addingVoice&&<button style={{display:"flex",alignItems:"center",gap:5,background:C.aDim,border:`1px solid ${C.aMid}`,borderRadius:8,color:C.accent,fontSize:11,fontWeight:500,padding:"5px 10px"}} onClick={()=>{setAddingVoice(true);setAddTranscript("");setAddError("");setTimeout(()=>speech.start(),100);}}>
-            <IcMic size={12}/> Add item
-          </button>}
+        <div style={{padding:"12px 16px 10px"}}>
+          <p style={{fontSize:11,fontWeight:400,color:C.sub,textTransform:"uppercase",letterSpacing:"1.2px"}}>Items</p>
         </div>
+
+        {ings.length===0&&!adding&&<div style={{padding:"4px 16px 14px"}}>
+          <p style={{fontSize:12,fontWeight:300,color:C.dim,lineHeight:1.6}}>No items yet. Photograph or say them one at a time — the total adds itself up.</p>
+        </div>}
+
         {ings.map((ing,idx)=><SwipeIngRow key={idx} ing={ing} idx={idx} editIdx={editIdx} editField={editField} servVal={servVal} calVal={calVal} setServVal={setServVal} setCalVal={setCalVal} setEditIdx={setEditIdx2} commitServ={commitServ} commitCal={commitCal} onDelete={i=>{const next=ings.filter((_,j)=>j!==i);setIngs(next);save(next);}}/>)}
 
-        {addingVoice&&<div style={{padding:"12px 14px",borderTop:`1px solid ${C.border}`}}>
+        {!adding&&<div style={{display:"flex",gap:8,padding:"12px 14px",borderTop:`1px solid ${C.border}`}}>
+          <button style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6,background:C.hover,border:`1px solid ${C.border}`,borderRadius:10,color:C.text,fontSize:12,fontWeight:400,padding:"11px"}} onClick={()=>photoRef.current.click()}>
+            <IcCamera size={15}/> Photo item
+          </button>
+          <button style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6,background:C.aDim,border:`1px solid ${C.aMid}`,borderRadius:10,color:C.accent,fontSize:12,fontWeight:400,padding:"11px"}} onClick={()=>{setAdding(true);setAddText("");setAddError("");baseRef.current="";setTimeout(()=>speech.start(),150);}}>
+            <IcMic size={15}/> Say item
+          </button>
+        </div>}
+
+        <input ref={photoRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={e=>{
+          const f=e.target.files[0]; e.target.value=""; if(f) addByPhoto(f);
+        }}/>
+
+        {adding&&<div style={{padding:"12px 14px",borderTop:`1px solid ${C.border}`}}>
           <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
-            <div onClick={speech.listening?speech.stop:speech.start}
+            <div onClick={speech.listening?speech.stop:startMic}
               style={{width:36,height:36,borderRadius:"50%",flexShrink:0,background:speech.listening?"rgba(255,68,68,0.12)":C.aDim,border:`2px solid ${speech.listening?C.red:C.accent}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer"}}>
               <div style={{color:speech.listening?C.red:C.accent}}>{speech.listening?<IcStop size={12}/>:<IcMic size={14}/>}</div>
             </div>
             {speech.listening
-              ?<div style={{flex:1,height:32}}><VoiceVisualizer active={true} mediaStream={null}/></div>
-              :<span style={{flex:1,fontSize:12,color:C.sub}}>Tap mic or type what to add</span>
-            }
+              ?<div style={{flex:1,height:32}}><ListeningBars active={true}/></div>
+              :<span style={{flex:1,fontSize:12,color:C.sub}}>Tap to speak, or type below</span>}
           </div>
-          <textarea style={{width:"100%",height:60,background:C.hover,border:`1px solid ${addTranscript?C.aMid:C.border}`,borderRadius:10,color:addTranscript?C.text:C.sub,fontSize:13,padding:"8px 12px",resize:"none",outline:"none",fontFamily:"'Inter',sans-serif",lineHeight:1.5,marginBottom:8}}
-            placeholder="e.g. half tablespoon of butter…"
-            value={addTranscript} onChange={e=>setAddTranscript(e.target.value)}/>
+          <textarea style={{width:"100%",height:60,background:C.hover,border:`1px solid ${addText?C.aMid:C.border}`,borderRadius:10,color:addText?C.text:C.sub,fontSize:13,padding:"9px 12px",resize:"none",outline:"none",fontFamily:"'Inter',sans-serif",lineHeight:1.5,marginBottom:8}}
+            placeholder="e.g. half tablespoon of butter"
+            value={addText} onChange={e=>setAddText(e.target.value)}/>
           {addError&&<p style={{color:C.red,fontSize:12,marginBottom:6}}>{addError}</p>}
           <div style={{display:"flex",gap:8}}>
-            <button style={{flex:1,background:"transparent",border:`1px solid ${C.border}`,borderRadius:10,color:C.sub,fontSize:13,fontWeight:600,padding:"10px"}} onClick={()=>{speech.stop();setAddingVoice(false);setAddTranscript("");setAddError("");}}>Cancel</button>
-            <button style={{flex:2,background:addLoading?"transparent":C.accent,border:addLoading?`1px solid ${C.aMid}`:"none",borderRadius:10,color:addLoading?C.accent:C.bg,fontSize:13,fontWeight:500,padding:"10px",opacity:addTranscript.trim()?1:0.35}} onClick={mergeItems} disabled={!addTranscript.trim()||addLoading}>
-              {addLoading?"Calculating…":"Add to meal →"}
+            <button style={{flex:1,background:"transparent",border:`1px solid ${C.border}`,borderRadius:10,color:C.sub,fontSize:13,fontWeight:500,padding:"10px"}} onClick={()=>{speech.stop();setAdding(false);setAddText("");setAddError("");}}>Cancel</button>
+            <button style={{flex:2,background:addLoading?"transparent":C.accent,border:addLoading?`1px solid ${C.aMid}`:"none",borderRadius:10,color:addLoading?C.accent:C.bg,fontSize:13,fontWeight:500,padding:"10px",opacity:addText.trim()?1:0.35}} onClick={addByText} disabled={!addText.trim()||addLoading}>
+              {addLoading?"Calculating…":"Add item →"}
             </button>
           </div>
         </div>}
+
+        {addError&&!adding&&<div style={{padding:"10px 16px",borderTop:`1px solid ${C.border}`}}>
+          <p style={{color:C.red,fontSize:12}}>{addError}</p>
+        </div>}
       </div>}
+
+      {/* Recent items — one tap, no API call */}
+      {!isWorkout&&recent.length>0&&<div style={{background:C.surface,borderRadius:16,border:`1px solid ${C.border}`,overflow:"hidden"}}>
+        <div style={{padding:"12px 16px 8px"}}>
+          <p style={{fontSize:11,fontWeight:400,color:C.sub,textTransform:"uppercase",letterSpacing:"1.2px"}}>Add a recent item</p>
+        </div>
+        {recent.map(it=>
+          <div key={it.key} onClick={()=>addRecent(it)}
+            style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"11px 16px",borderTop:`1px solid ${C.border}`,cursor:"pointer"}}>
+            <div style={{flex:1,minWidth:0,paddingRight:10}}>
+              <p style={{fontSize:13,fontWeight:300,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</p>
+              {it.uses>1&&<p style={{fontSize:10,fontWeight:300,color:C.dim,marginTop:1}}>used {it.uses}×</p>}
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+              <span style={{fontSize:14,fontWeight:300,color:C.accent}}>{it.calories}</span>
+              <span style={{color:C.accent,display:"inline-flex"}}><IcPlus size={14}/></span>
+            </div>
+          </div>
+        )}
+      </div>}
+    </div>
+  </div>;
+}
+
+function LibraryScreen({onBack,onPickMeal,onPickItem}) {
+  const [tab,setTab]=useState("meals");
+  const [lib,setLib]=useState(()=>loadLibrary().sort(itemSort));
+  const [items,setItems]=useState(()=>loadItems().sort(itemSort));
+  const [q,setQ]=useState("");
+  const term = q.trim().toLowerCase();
+
+  const meals = term
+    ? lib.filter(t=>t.mealTitle.toLowerCase().includes(term) || t.ingredients.some(i=>i.name.toLowerCase().includes(term)))
+    : lib;
+  const foods = term ? items.filter(t=>t.name.toLowerCase().includes(term)) : items;
+
+  const removeMeal = key => { const next=lib.filter(t=>t.key!==key); setLib(next); saveLibrary(next); };
+  const removeItem = key => { const next=items.filter(t=>t.key!==key); setItems(next); saveItems(next); };
+
+  const Tab = ({id,label,count}) => <button
+    style={{flex:1,padding:"9px",borderRadius:10,border:"none",fontSize:13,fontWeight:400,
+      background: tab===id?C.aDim:"transparent", color: tab===id?C.accent:C.sub}}
+    onClick={()=>setTab(id)}>{label} <span style={{opacity:0.6,fontSize:11}}>{count}</span></button>;
+
+  return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:48}}>
+    <StickyHeader left={<HeaderBtn onClick={onBack}><IcBack/></HeaderBtn>} title="Recent"/>
+    <div style={{padding:"12px 16px 10px",position:"sticky",top:"calc(env(safe-area-inset-top,44px) + 68px)",background:C.bg,zIndex:20}}>
+      <div style={{display:"flex",gap:4,background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:4,marginBottom:10}}>
+        <Tab id="meals" label="Meals" count={lib.length}/>
+        <Tab id="items" label="Ingredients" count={items.length}/>
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:9,background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 13px"}}>
+        <span style={{color:C.dim,display:"flex"}}><IcSearch/></span>
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder={tab==="meals"?"Search meals":"Search ingredients"}
+          style={{flex:1,background:"transparent",border:"none",color:C.text,fontSize:14,outline:"none",fontFamily:"'Inter',sans-serif"}}/>
+        {q&&<button style={{background:"none",border:"none",color:C.dim,fontSize:13,padding:0}} onClick={()=>setQ("")}>Clear</button>}
+      </div>
+    </div>
+
+    <div style={{padding:"4px 16px 0"}}>
+      {tab==="meals"&&<>
+        {lib.length===0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"56px 24px",gap:10}}>
+          <span style={{fontSize:36}}>🗂️</span>
+          <p style={{color:C.sub,fontSize:14,fontWeight:300,textAlign:"center",lineHeight:1.6}}>Meals you log show up here, ready to add again in one tap.</p>
+        </div>}
+        {lib.length>0&&meals.length===0&&<p style={{color:C.sub,fontSize:13,fontWeight:300,textAlign:"center",padding:"40px 0"}}>Nothing matches "{q}".</p>}
+        {meals.length>0&&<p style={{fontSize:11,fontWeight:300,color:C.dim,marginBottom:12}}>Most-used first · tap to add to this day, swipe left to remove</p>}
+        {meals.map(t=><LibraryMealRow key={t.key} tpl={t} onPick={()=>onPickMeal(t)} onDelete={()=>removeMeal(t.key)}/>)}
+      </>}
+      {tab==="items"&&<>
+        {items.length===0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"56px 24px",gap:10}}>
+          <span style={{fontSize:36}}>🥕</span>
+          <p style={{color:C.sub,fontSize:14,fontWeight:300,textAlign:"center",lineHeight:1.6}}>Every ingredient you log lands here. The ones you pick most rise to the top.</p>
+        </div>}
+        {items.length>0&&foods.length===0&&<p style={{color:C.sub,fontSize:13,fontWeight:300,textAlign:"center",padding:"40px 0"}}>Nothing matches "{q}".</p>}
+        {foods.length>0&&<p style={{fontSize:11,fontWeight:300,color:C.dim,marginBottom:12}}>Most-used first · tap to start a meal with it, swipe left to remove</p>}
+        {foods.map(t=><LibraryItemRow key={t.key} item={t} onPick={()=>onPickItem(t)} onDelete={()=>removeItem(t.key)}/>)}
+      </>}
+    </div>
+  </div>;
+}
+
+function useSwipeDelete(onDelete, threshold=75) {
+  const [swipeX,setSwipeX]=useState(0);
+  const [swiping,setSwiping]=useState(false);
+  const tx=useRef(0),ty=useRef(0);
+  return {
+    swipeX, swiping,
+    handlers: {
+      onTouchStart: e=>{tx.current=e.touches[0].clientX;ty.current=e.touches[0].clientY;setSwiping(false);},
+      onTouchMove: e=>{const dx=e.touches[0].clientX-tx.current;const dy=Math.abs(e.touches[0].clientY-ty.current);if(dy>20&&Math.abs(dx)<20)return;if(dx<0){setSwiping(true);setSwipeX(Math.max(dx,-(threshold+25)));}},
+      onTouchEnd: ()=>{if(swipeX<=-threshold)onDelete();else{setSwipeX(0);setSwiping(false);}}
+    }
+  };
+}
+
+function LibraryMealRow({tpl,onPick,onDelete}) {
+  const {swipeX,swiping,handlers}=useSwipeDelete(onDelete);
+  return <div style={{position:"relative",marginBottom:9,borderRadius:15,overflow:"hidden"}}>
+    <div style={{position:"absolute",inset:0,background:C.red,display:"flex",alignItems:"center",justifyContent:"flex-end",paddingRight:18}}>
+      <span style={{color:"#fff",fontSize:12,fontWeight:400,marginRight:5}}>Remove</span><IcTrash/>
+    </div>
+    <div style={{display:"flex",alignItems:"center",gap:12,background:C.card,border:`1px solid ${C.border}`,borderRadius:15,padding:"12px 14px",cursor:"pointer",transform:`translateX(${swipeX}px)`,transition:swiping?"none":"transform 0.3s ease"}}
+      onClick={()=>{if(swipeX===0)onPick();}} {...handlers}>
+      <div style={{width:44,height:44,borderRadius:11,background:C.hover,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+        <span style={{fontSize:20}}>{tpl.emoji}</span>
+      </div>
+      <div style={{flex:1,minWidth:0}}>
+        <p style={{fontSize:13,fontWeight:400,color:C.text,marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tpl.mealTitle}</p>
+        <p style={{fontSize:11,fontWeight:300,color:C.dim}}>
+          {tpl.ingredients.length} {tpl.ingredients.length===1?"item":"items"} · {shortDate(tpl.lastUsed)}{tpl.uses>1?` · ${tpl.uses}×`:""}
+        </p>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2,flexShrink:0}}>
+        <div style={{display:"flex",alignItems:"baseline",gap:3,padding:"5px 10px",background:C.aDim,borderRadius:10}}>
+          <span style={{fontSize:17,fontWeight:200,color:C.accent,letterSpacing:"-0.5px"}}>{tpl.totalCalories}</span>
+          <span style={{fontSize:9,fontWeight:300,color:C.aMid,textTransform:"uppercase"}}>cal</span>
+        </div>
+        <div style={{display:"flex",gap:5}}>
+          {(tpl.totalProteinG||0)>0&&<span style={{fontSize:9,fontWeight:300,color:C.protein}}>{Math.round(tpl.totalProteinG)}p</span>}
+          {(tpl.totalCarbsG||0)>0&&<span style={{fontSize:9,fontWeight:300,color:C.carbs}}>{Math.round(tpl.totalCarbsG)}c</span>}
+          {(tpl.totalFatG||0)>0&&<span style={{fontSize:9,fontWeight:300,color:C.fat}}>{Math.round(tpl.totalFatG)}f</span>}
+        </div>
+      </div>
+    </div>
+  </div>;
+}
+
+function LibraryItemRow({item,onPick,onDelete}) {
+  const {swipeX,swiping,handlers}=useSwipeDelete(onDelete);
+  return <div style={{position:"relative",marginBottom:8,borderRadius:14,overflow:"hidden"}}>
+    <div style={{position:"absolute",inset:0,background:C.red,display:"flex",alignItems:"center",justifyContent:"flex-end",paddingRight:18}}>
+      <span style={{color:"#fff",fontSize:12,fontWeight:400,marginRight:5}}>Remove</span><IcTrash/>
+    </div>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"12px 14px",cursor:"pointer",transform:`translateX(${swipeX}px)`,transition:swiping?"none":"transform 0.3s ease"}}
+      onClick={()=>{if(swipeX===0)onPick();}} {...handlers}>
+      <div style={{flex:1,minWidth:0,paddingRight:10}}>
+        <p style={{fontSize:13,fontWeight:400,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.name}</p>
+        <div style={{display:"flex",gap:8,marginTop:3}}>
+          {(item.proteinG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:C.protein}}>{Math.round(item.proteinG)}p</span>}
+          {(item.carbsG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:C.carbs}}>{Math.round(item.carbsG)}c</span>}
+          {(item.fatG||0)>0&&<span style={{fontSize:10,fontWeight:300,color:C.fat}}>{Math.round(item.fatG)}f</span>}
+          {item.uses>1&&<span style={{fontSize:10,fontWeight:300,color:C.dim}}>{item.uses}×</span>}
+        </div>
+      </div>
+      <div style={{display:"flex",alignItems:"baseline",gap:3,padding:"5px 10px",background:C.aDim,borderRadius:10,flexShrink:0}}>
+        <span style={{fontSize:16,fontWeight:200,color:C.accent,letterSpacing:"-0.5px"}}>{item.calories}</span>
+        <span style={{fontSize:9,fontWeight:300,color:C.aMid,textTransform:"uppercase"}}>cal</span>
+      </div>
+    </div>
+  </div>;
+}
+
+/* ─── Progress photos ───────────────────────────────────────────────────────*/
+function ProgressScreen({onBack}) {
+  const [photos,setPhotos]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [aId,setAId]=useState(null);
+  const [bId,setBId]=useState(null);
+  const [activeSlot,setActiveSlot]=useState("b");
+  const [busy,setBusy]=useState("");
+  const [confirmDel,setConfirmDel]=useState(null);
+  const fileRef=useRef();
+  const weights=useRef(loadWeights()).current;
+
+  const refresh = async () => {
+    const all = await progressAll();
+    setPhotos(all);
+    setLoading(false);
+    if (all.length) {
+      setAId(prev => prev && all.find(p=>p.id===prev) ? prev : all[0].id);
+      setBId(prev => prev && all.find(p=>p.id===prev) ? prev : all[all.length-1].id);
+    } else { setAId(null); setBId(null); }
+  };
+  useEffect(()=>{ refresh(); },[]);
+
+  const add = async file => {
+    setBusy("Saving photo…");
+    try {
+      const shot = await fileToImageData(file, PROGRESS_MAX_PX);
+      if (shot) {
+        const thumb = await makeThumbnail(shot.imageData.base64, "image/jpeg", PROGRESS_MAX_PX, PROGRESS_QUALITY);
+        const takenAt = Date.now();
+        await progressPut({
+          id:"p"+takenAt, takenAt,
+          dateKey: fmtKey(new Date()),
+          base64: thumb || shot.imageData.base64
+        });
+        await refresh();
+        setBId("p"+takenAt);
+      }
+    } catch(e) { console.warn("progress save failed:",e); }
+    setBusy("");
+  };
+
+  const remove = async id => {
+    setBusy("Removing…");
+    try { await progressDelete(id); await refresh(); } catch(e) { console.warn(e); }
+    setConfirmDel(null);
+    setBusy("");
+  };
+
+  const byId = id => photos.find(p=>p.id===id);
+  const weightOn = dateKey => weights.find(w=>w.date===dateKey)?.value;
+  const a = byId(aId), b = byId(bId);
+  const dayGap = a && b ? Math.round(Math.abs(b.takenAt-a.takenAt)/86400000) : 0;
+  const wA = a && weightOn(a.dateKey), wB = b && weightOn(b.dateKey);
+  const wDelta = (wA!=null && wB!=null) ? Math.round((wB-wA)*10)/10 : null;
+
+  if (busy) return <Spinner text={busy}/>;
+
+  const Pane = ({photo,slot,label}) => {
+    const active = activeSlot===slot;
+    return <div style={{flex:1,minWidth:0}} onClick={()=>setActiveSlot(slot)}>
+      <div style={{position:"relative",width:"100%",aspectRatio:"3 / 4",borderRadius:14,overflow:"hidden",
+        background:C.surface,border:`2px solid ${active?C.accent:C.border}`,transition:"border-color 0.2s"}}>
+        {photo
+          ? <img src={`data:image/jpeg;base64,${photo.base64}`} style={{width:"100%",height:"100%",objectFit:"cover",display:"block"}} alt=""/>
+          : <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:28,opacity:0.3}}>👤</span></div>}
+        <div style={{position:"absolute",top:8,left:8,background:"rgba(10,10,15,0.75)",borderRadius:7,padding:"3px 8px"}}>
+          <span style={{fontSize:10,fontWeight:400,color:active?C.accent:C.text}}>{label}</span>
+        </div>
+      </div>
+      <div style={{marginTop:7,textAlign:"center"}}>
+        <p style={{fontSize:12,fontWeight:300,color:C.text}}>{photo?shortDate(photo.takenAt):"—"}</p>
+        {photo&&weightOn(photo.dateKey)!=null&&<p style={{fontSize:10,fontWeight:300,color:C.dim,marginTop:1}}>{weightOn(photo.dateKey)} lbs</p>}
+      </div>
+    </div>;
+  };
+
+  return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:48}}>
+    <StickyHeader
+      left={<HeaderBtn onClick={onBack}><IcBack/></HeaderBtn>}
+      title="Progress photos"
+      right={<HeaderBtn onClick={()=>fileRef.current.click()}><IcCamera size={19}/></HeaderBtn>}
+    />
+    <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={e=>{
+      const f=e.target.files[0]; e.target.value=""; if(f) add(f);
+    }}/>
+
+    {loading&&<p style={{color:C.sub,fontSize:13,textAlign:"center",padding:"48px 0"}}>Loading…</p>}
+
+    {!loading&&photos.length===0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"64px 32px",gap:12}}>
+      <span style={{fontSize:40}}>📸</span>
+      <p style={{color:C.sub,fontSize:14,fontWeight:300,textAlign:"center",lineHeight:1.6}}>Take your first photo to start the timeline. Same spot, same light, same time of day works best.</p>
+      <button style={{marginTop:6,display:"flex",alignItems:"center",gap:8,background:C.accent,border:"none",borderRadius:13,color:C.bg,fontSize:14,fontWeight:500,padding:"13px 22px"}} onClick={()=>fileRef.current.click()}>
+        <IcCamera size={17}/> Take photo
+      </button>
+    </div>}
+
+    {!loading&&photos.length>0&&<div style={{padding:"16px 16px 0"}}>
+      {photos.length===1
+        ? <p style={{fontSize:12,fontWeight:300,color:C.dim,textAlign:"center",marginBottom:14,lineHeight:1.6}}>One photo so far. Take another later and they'll appear side by side.</p>
+        : <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,marginBottom:14}}>
+            <span style={{fontSize:12,fontWeight:300,color:C.sub}}>{dayGap} {dayGap===1?"day":"days"} apart</span>
+            {wDelta!==null&&<span style={{fontSize:12,fontWeight:300,color:wDelta<0?C.accent:C.orange}}>
+              {wDelta<0?"↓":"↑"}{Math.abs(wDelta)} lbs
+            </span>}
+          </div>}
+
+      <div style={{display:"flex",gap:10,marginBottom:18}}>
+        <Pane photo={a} slot="a" label="Before"/>
+        <Pane photo={b} slot="b" label="After"/>
+      </div>
+
+      <p style={{fontSize:11,fontWeight:300,color:C.dim,marginBottom:10}}>
+        Tap a pane to select it, then pick a photo below. Long-press a photo to delete.
+      </p>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4, 1fr)",gap:8,paddingBottom:20}}>
+        {[...photos].reverse().map(p=>{
+          const chosen = p.id===aId || p.id===bId;
+          const tag = p.id===aId ? "A" : p.id===bId ? "B" : null;
+          return <div key={p.id} style={{position:"relative"}}>
+            <div
+              onClick={()=>{ if(activeSlot==="a") setAId(p.id); else setBId(p.id); }}
+              onContextMenu={e=>{e.preventDefault();setConfirmDel(p.id);}}
+              style={{position:"relative",width:"100%",aspectRatio:"3 / 4",borderRadius:10,overflow:"hidden",
+                border:`2px solid ${chosen?C.accent:"transparent"}`,cursor:"pointer",background:C.surface}}>
+              <img src={`data:image/jpeg;base64,${p.base64}`} style={{width:"100%",height:"100%",objectFit:"cover",display:"block",opacity:chosen?1:0.65}} alt=""/>
+              {tag&&<div style={{position:"absolute",top:3,right:3,width:16,height:16,borderRadius:5,background:C.accent,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                <span style={{fontSize:9,fontWeight:600,color:C.bg}}>{tag}</span>
+              </div>}
+            </div>
+            <p style={{fontSize:9,fontWeight:300,color:C.dim,textAlign:"center",marginTop:3}}>{shortDate(p.takenAt)}</p>
+            {confirmDel===p.id&&<div style={{position:"absolute",inset:0,background:"rgba(10,10,15,0.92)",borderRadius:10,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:5,padding:4}}>
+              <button style={{background:C.red,border:"none",borderRadius:7,color:"#fff",fontSize:10,fontWeight:500,padding:"5px 9px"}} onClick={()=>remove(p.id)}>Delete</button>
+              <button style={{background:"transparent",border:"none",color:C.sub,fontSize:10,padding:2}} onClick={()=>setConfirmDel(null)}>Cancel</button>
+            </div>}
+          </div>;
+        })}
+      </div>
+    </div>}
+  </div>;
+}
+
+/* Per-macro history: 30-day bars against target, plus a day-by-day list. */
+function NutrientHistoryScreen({metric,goal,onBack}) {
+  const META = {
+    protein:{label:"Protein", color:C.protein},
+    carbs:  {label:"Carbs",   color:C.carbs},
+    fat:    {label:"Fat",     color:C.fat}
+  };
+  const meta = META[metric] || META.protein;
+  const target = macroTargets(goal)[metric] || 0;
+  const days = useRef(collectDays(30)).current;
+  const logged = days.filter(d=>d.calories>0);
+  const avg = logged.length ? Math.round(logged.reduce((s,d)=>s+d[metric],0)/logged.length) : 0;
+  const hits = logged.filter(d=>d[metric]>=target).length;
+  const peak = Math.max(target, ...days.map(d=>d[metric]), 1);
+  const targetY = (target/peak)*100;
+
+  const fmtDay = k => new Date(k+"T12:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+
+  return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:48}}>
+    <StickyHeader left={<HeaderBtn onClick={onBack}><IcBack/></HeaderBtn>} title={`${meta.label} history`}/>
+    <div style={{padding:"16px 16px 0"}}>
+
+      <div style={{display:"flex",gap:10,marginBottom:16}}>
+        {[["Average",`${avg}g`],["Target",`${target}g`],["Days hit",`${hits}/${logged.length||0}`]].map(([l,v])=>
+          <div key={l} style={{flex:1,background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:"12px 10px",display:"flex",flexDirection:"column",alignItems:"center"}}>
+            <span style={{fontSize:17,fontWeight:200,color:meta.color,letterSpacing:"-0.5px"}}>{v}</span>
+            <span style={{fontSize:9,color:C.dim,textTransform:"uppercase",letterSpacing:"0.5px",marginTop:3}}>{l}</span>
+          </div>
+        )}
+      </div>
+
+      <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:16,padding:"16px 16px 12px",marginBottom:16}}>
+        <p style={{fontSize:10,fontWeight:400,color:C.sub,textTransform:"uppercase",letterSpacing:"1px",marginBottom:14}}>Last 30 days</p>
+        <div style={{position:"relative",height:120,marginBottom:8}}>
+          {target>0&&<div style={{position:"absolute",left:0,right:0,bottom:`${targetY}%`,borderTop:`1px dashed ${C.dim}`,zIndex:1}}>
+            <span style={{position:"absolute",right:0,top:-13,fontSize:9,color:C.dim}}>{target}g</span>
+          </div>}
+          <div style={{display:"flex",alignItems:"flex-end",gap:2,height:"100%"}}>
+            {days.map(d=>{
+              const v=d[metric];
+              const h=Math.max(v>0?3:1,(v/peak)*100);
+              return <div key={d.date} style={{flex:1,minWidth:0,height:`${h}%`,
+                background: v===0 ? C.track : v>=target ? meta.color : `${meta.color}66`,
+                borderRadius:"2px 2px 0 0"}}/>;
+            })}
+          </div>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between"}}>
+          <span style={{fontSize:9,fontWeight:300,color:C.dim}}>{fmtDay(days[0].date)}</span>
+          <span style={{fontSize:9,fontWeight:300,color:C.dim}}>Today</span>
+        </div>
+      </div>
+
+      <p style={{fontSize:11,fontWeight:300,color:C.dim,marginBottom:10}}>Days with food logged</p>
+      {logged.length===0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"40px 0",gap:10}}>
+        <span style={{fontSize:34}}>📊</span>
+        <p style={{color:C.sub,fontSize:14,fontWeight:300,textAlign:"center"}}>Nothing logged in the last 30 days.</p>
+      </div>}
+      {[...logged].reverse().map(d=>{
+        const v=d[metric];
+        const pct=target>0?Math.round((v/target)*100):0;
+        return <div key={d.date} style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:C.surface,border:`1px solid ${C.border}`,borderRadius:13,padding:"12px 15px",marginBottom:7}}>
+          <div style={{flex:1,minWidth:0}}>
+            <p style={{fontSize:13,fontWeight:300,color:C.text}}>{fmtDay(d.date)}</p>
+            <div style={{height:4,borderRadius:2,background:C.track,overflow:"hidden",marginTop:6,maxWidth:150}}>
+              <div style={{width:`${Math.min(pct,100)}%`,height:"100%",background:meta.color,borderRadius:2}}/>
+            </div>
+          </div>
+          <div style={{display:"flex",alignItems:"baseline",gap:5,flexShrink:0,paddingLeft:12}}>
+            <span style={{fontSize:18,fontWeight:200,color:meta.color,letterSpacing:"-0.5px"}}>{v}</span>
+            <span style={{fontSize:10,fontWeight:300,color:C.dim}}>g · {pct}%</span>
+          </div>
+        </div>;
+      })}
     </div>
   </div>;
 }
@@ -1044,34 +1826,20 @@ function WeightHistoryScreen({onBack}) {
   const [editVal,setEditVal]=useState("");
 
   const saveAll = next => { setLog(next); saveWeights([...loadWeights().filter(w=>!next.find(n=>n.date===w.date)), ...next].sort((a,b)=>a.date.localeCompare(b.date))); };
-
   const commitEdit = date => {
     const n=parseFloat(editVal);
-    if(!isNaN(n)&&n>0){
-      const next=log.map(w=>w.date===date?{...w,value:n}:w);
-      saveAll(next);
-    }
+    if(!isNaN(n)&&n>0) saveAll(log.map(w=>w.date===date?{...w,value:n}:w));
     setEditDate(null);
   };
-
   const deleteEntry = date => {
-    const next=log.filter(w=>w.date!==date);
-    setLog(next);
+    setLog(log.filter(w=>w.date!==date));
     saveWeights(loadWeights().filter(w=>w.date!==date));
   };
-
-  const fmt = dateStr => {
-    const d=new Date(dateStr+"T12:00:00");
-    return d.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
-  };
+  const fmt = dateStr => new Date(dateStr+"T12:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
 
   return <div style={{height:"100%",background:C.bg,overflowY:"auto",paddingBottom:48}}>
-    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"calc(env(safe-area-inset-top,44px) + 12px) 16px 20px"}}>
-      <button style={{width:44,height:44,borderRadius:12,background:C.hover,border:`1px solid ${C.border}`,color:C.text,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onBack}><IcBack/></button>
-      <span style={{fontSize:16,fontWeight:500,color:C.text}}>Weight History</span>
-      <div style={{width:44}}/>
-    </div>
-    <div style={{padding:"0 16px"}}>
+    <StickyHeader left={<HeaderBtn onClick={onBack}><IcBack/></HeaderBtn>} title="Weight history"/>
+    <div style={{padding:"16px 16px 0"}}>
       <p style={{fontSize:12,fontWeight:300,color:C.dim,marginBottom:16}}>Last 30 days — swipe left to delete</p>
       {log.length===0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"48px 0",gap:10}}>
         <span style={{fontSize:36}}>⚖️</span>
@@ -1083,17 +1851,13 @@ function WeightHistoryScreen({onBack}) {
 }
 
 function WeightRow({entry,isEditing,editVal,setEditVal,onTapEdit,onCommit,onDelete,fmt}) {
-  const [swipeX,setSwipeX]=useState(0);const[swiping,setSwiping]=useState(false);
-  const tx=useRef(0),ty=useRef(0);const THRESHOLD=70;
-  const onTS=e=>{tx.current=e.touches[0].clientX;ty.current=e.touches[0].clientY;setSwiping(false);};
-  const onTM=e=>{const dx=e.touches[0].clientX-tx.current;const dy=Math.abs(e.touches[0].clientY-ty.current);if(dy>20&&Math.abs(dx)<20)return;if(dx<0){setSwiping(true);setSwipeX(Math.max(dx,-(THRESHOLD+20)));}};
-  const onTE=()=>{if(swipeX<=-THRESHOLD)onDelete();else{setSwipeX(0);setSwiping(false);}};
+  const {swipeX,swiping,handlers}=useSwipeDelete(onDelete,70);
   return <div style={{position:"relative",marginBottom:8,borderRadius:14,overflow:"hidden"}}>
     <div style={{position:"absolute",inset:0,background:C.red,display:"flex",alignItems:"center",justifyContent:"flex-end",paddingRight:18}}>
       <span style={{color:"#fff",fontSize:12,fontWeight:400,marginRight:4}}>Delete</span><IcTrash/>
     </div>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 16px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,transform:`translateX(${swipeX}px)`,transition:swiping?"none":"transform 0.3s ease"}}
-      onTouchStart={onTS} onTouchMove={onTM} onTouchEnd={onTE}>
+      {...handlers}>
       <span style={{fontSize:13,fontWeight:300,color:C.sub}}>{fmt(entry.date)}</span>
       <div style={{display:"flex",alignItems:"baseline",gap:6}}>
         {isEditing
@@ -1110,10 +1874,10 @@ function WeightRow({entry,isEditing,editVal,setEditVal,onTapEdit,onCommit,onDele
 function App() {
   const [apiKey,setApiKey]=useState(()=>loadKey());
   const [screen,setScreen]=useState("home");
-
   const [baseGoal,setBaseGoal]=useState(()=>loadBaseGoal());
   const [selected,setSelected]=useState(null);
   const [camImg,setCamImg]=useState({imageData:null,preview:null});
+  const [macroMetric,setMacroMetric]=useState("protein");
   const dateKeyRef=useRef(fmtKey(new Date()));
   const [,forceRender]=useState(0);
   const bump=()=>forceRender(n=>n+1);
@@ -1121,26 +1885,83 @@ function App() {
   const meals=loadMeals(dateKey);
   const burned=meals.filter(m=>m.type==="workout").reduce((s,m)=>s+m.totalCalories,0);
   const effectiveGoal=baseGoal+burned;
+
   const changeDate=d=>{const k=fmtKey(d);if(k===dateKeyRef.current)return;dateKeyRef.current=k;bump();};
-  const addMeal=async m=>{
-    recordFoodItems(m.ingredients);
+  const nowStamp = () => {
+    const now=new Date();
+    return { time: now.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}), addedAt: now.getTime() };
+  };
+
+  // Saves the meal, then opens it so items can be added right away.
+  const addMeal = async m => {
+    recordItems(m.ingredients);
     const k=dateKeyRef.current;
+    const raw = m.imageBase64 ? {base64:m.imageBase64, mimeType:m.imageMime||"image/jpeg"} : null;
     let storable=m;
-    if(m.imageBase64){
-      const thumb=await makeThumbnail(m.imageBase64, m.imageMime||"image/jpeg", 120, 0.7);
-      storable={...m, imageBase64:thumb||null};
+    if (raw) {
+      const thumb = await makeThumbnail(raw.base64, raw.mimeType);
+      storable = {...m, imageBase64: thumb || null};
     }
-    saveMeals(k,[...loadMeals(k),storable]);
-    setScreen("home");
+    await saveMealsWithFallback(k, [...loadMeals(k), storable], raw);
+    recordMealTemplate(storable);
+    setSelected(storable); setScreen("detail"); bump();
+  };
+
+  const addWorkout=w=>{const k=dateKeyRef.current;saveMeals(k,[...loadMeals(k),w]);bump();};
+
+  const updateMeal=m=>{
+    const k=dateKeyRef.current;
+    saveMeals(k,loadMeals(k).map(x=>x.id===m.id?m:x));
+    setSelected(m);
     bump();
   };
-  const addWorkout=w=>{const k=dateKeyRef.current;saveMeals(k,[...loadMeals(k),w]);bump();};
-  const updateMeal=m=>{recordFoodItems(m.ingredients);const k=dateKeyRef.current;saveMeals(k,loadMeals(k).map(x=>x.id===m.id?m:x));setSelected(m);bump();};
+
   const deleteMeal=id=>{const k=dateKeyRef.current;saveMeals(k,loadMeals(k).filter(x=>x.id!==id));setScreen("home");bump();};
+
+
+  const addFromLibrary = tpl => {
+    const k=dateKeyRef.current;
+    const m={
+      id:uid(), mealTitle:tpl.mealTitle, emoji:tpl.emoji, summary:tpl.summary,
+      totalCalories:tpl.totalCalories, totalProteinG:tpl.totalProteinG,
+      totalCarbsG:tpl.totalCarbsG||0, totalFatG:tpl.totalFatG||0,
+      ingredients:tpl.ingredients.map(i=>({...i})), imageBase64:null, ...nowStamp()
+    };
+    saveMeals(k,[...loadMeals(k),m]);
+    recordMealTemplate(m); recordItems(m.ingredients);
+    setSelected(m); setScreen("detail"); bump();
+  };
+
+  // Start a meal from a single saved ingredient.
+  const addItemAsMeal = it => {
+    const k=dateKeyRef.current;
+    const ing={name:it.name,calories:it.calories,proteinG:it.proteinG||0,carbsG:it.carbsG||0,fatG:it.fatG||0,
+      baseCalories:it.calories,baseProteinG:it.proteinG||0,baseCarbsG:it.carbsG||0,baseFatG:it.fatG||0,servings:1};
+    const m={
+      id:uid(), mealTitle:it.name, emoji:"🍽️", summary:"",
+      totalCalories:it.calories, totalProteinG:it.proteinG||0,
+      totalCarbsG:it.carbsG||0, totalFatG:it.fatG||0,
+      ingredients:[ing], imageBase64:null, ...nowStamp()
+    };
+    saveMeals(k,[...loadMeals(k),m]);
+    recordItems([ing]);
+    setSelected(m); setScreen("detail"); bump();
+  };
+
+  const leaveDetail = () => {
+    const k=dateKeyRef.current;
+    const cur=loadMeals(k).find(x=>x.id===selected?.id);
+    if (cur && cur.type!=="workout" && !(cur.ingredients||[]).length && !cur.totalCalories) {
+      saveMeals(k, loadMeals(k).filter(x=>x.id!==cur.id));
+    } else if (cur) {
+      recordMealTemplate(cur);
+    }
+    setScreen("home"); bump();
+  };
+
   const clearApiKey=()=>{saveKey("");setApiKey("");};
   const saveApiKey=k=>{saveKey(k);setApiKey(k);};
   const selectMeal=m=>{
-    if(m._quickEdit){const k=dateKeyRef.current;saveMeals(k,loadMeals(k).map(x=>x.id===m.id?{...x,totalCalories:m._newCal}:x));bump();return;}
     if(m._delete){const k=dateKeyRef.current;saveMeals(k,loadMeals(k).filter(x=>x.id!==m.id));bump();return;}
     setSelected(m);setScreen("detail");
   };
@@ -1150,21 +1971,29 @@ function App() {
   return <div style={{height:"100%"}}>
     {screen==="home"&&<HomeScreen
       onOpenCamera={(imageData,preview)=>{setCamImg({imageData,preview});setScreen("camera");}}
-      onOpenVoice={()=>setScreen("voice")}
+      onOpenDescribe={()=>setScreen("describe")}
+      onOpenLibrary={()=>setScreen("library")}
       onAddWorkout={addWorkout} onSelectMeal={selectMeal}
       onOpenSettings={()=>setScreen("settings")}
       onOpenWeightHistory={()=>setScreen("weightHistory")}
+      onOpenProgress={()=>setScreen("progress")}
+      onOpenMacro={m=>{setMacroMetric(m);setScreen("macroHistory");}}
       meals={meals} goal={effectiveGoal} baseGoal={baseGoal}
       setBaseGoal={n=>{setBaseGoal(n);saveBaseGoal(n);}}
       date={new Date(dateKey+"T12:00:00")} setDate={changeDate}
     />}
     {screen==="camera"&&<PhotoScreen apiKey={apiKey} imageData={camImg.imageData} imagePreview={camImg.preview} onBack={()=>setScreen("home")} onAdd={addMeal}/>}
-    {screen==="voice"&&<VoiceScreen apiKey={apiKey} onBack={()=>setScreen("home")} onAdd={addMeal}/>}
-    {screen==="detail"&&selected&&<DetailScreen meal={selected} onBack={()=>setScreen("home")} onUpdate={updateMeal} onDelete={deleteMeal} apiKey={apiKey}/>}
-    {screen==="settings"&&<SettingsScreen apiKey={apiKey} onSave={saveApiKey} onClear={clearApiKey} onBack={()=>setScreen("home")}/>}
+    {screen==="describe"&&<DescribeScreen apiKey={apiKey} onBack={()=>setScreen("home")} onAdd={addMeal}/>}
+    {screen==="library"&&<LibraryScreen onBack={()=>setScreen("home")} onPickMeal={addFromLibrary} onPickItem={addItemAsMeal}/>}
+    {screen==="progress"&&<ProgressScreen onBack={()=>setScreen("home")}/>}
+    {screen==="detail"&&selected&&<DetailScreen meal={selected} onBack={leaveDetail} onUpdate={updateMeal} onDelete={deleteMeal} apiKey={apiKey}/>}
+    {screen==="settings"&&<SettingsScreen apiKey={apiKey} onSave={saveApiKey} onClear={clearApiKey} onBack={()=>setScreen("home")} goal={effectiveGoal}/>}
     {screen==="weightHistory"&&<WeightHistoryScreen onBack={()=>setScreen("home")}/>}
+    {screen==="macroHistory"&&<NutrientHistoryScreen metric={macroMetric} goal={effectiveGoal} onBack={()=>setScreen("home")}/>}
   </div>;
 }
+
+prunePhotos();
 
 if (window.__bootTimeout) clearTimeout(window.__bootTimeout);
 try {
