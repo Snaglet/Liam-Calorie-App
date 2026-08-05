@@ -1,0 +1,9 @@
+{
+  "name": "Just Calories",
+  "short_name": "Just Calories",
+  "display": "standalone",
+  "start_url": "./",
+  "scope": "./",
+  "background_color": "#0A0A0F",
+  "theme_color": "#0A0A0F"
+}
